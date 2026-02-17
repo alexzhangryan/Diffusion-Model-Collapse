@@ -1,0 +1,402 @@
+================================================================================
+                         DIFFUSION COLLAPSE PROJECT LOG
+================================================================================
+
+Project Name: DiffusionCollapse
+Started: February 9, 2026
+Location: /Users/alexryan/Desktop/Research
+
+================================================================================
+                              PROJECT OVERVIEW
+================================================================================
+
+PROJECT GOAL: Measure and study diffusion model collapse
+
+This project investigates collapse phenomena in diffusion models by implementing
+and comparing different generative modeling approaches. The main components include:
+
+1. EDM (Elucidating the Design Space of Diffusion-Based Generative Models)
+   - Image generation using pre-trained diffusion models
+   - FID (Fréchet Inception Distance) score calculation
+   - Tools for measuring distribution quality and collapse
+
+2. Gaussian Mixture Model (GMM)
+   - Custom implementation using Expectation-Maximization (EM) algorithm
+   - Sample generation and statistical analysis
+   - Baseline for comparing against diffusion model behavior
+
+Research Focus:
+- Measure and quantify collapse in diffusion model outputs
+- Compare diffusion model distributions to GMM baselines
+- Analyze how iterative sampling affects distribution quality
+- Study conditions that lead to mode collapse or distribution degradation
+- Find minimum number of real data samples needed to prevent collapse
+
+Research Approach:
+- Phase 1: Start with GMM toy problem for midterm presentation
+- Phase 2: Scale to diffusion models
+- Create pipeline (servers not yet set up)
+- Use FID matrix to test if images are "real"
+- Record mean and variance of models throughout training/generation
+- Avoid concentrating too much probability mass in the middle of distributions
+
+================================================================================
+                           LITERATURE REVIEW
+================================================================================
+
+Key Papers Reviewed:
+---
+
+1. "AI Models Collapse When Trained on Recursively Generated Data"
+   Source: file:///Users/alexryan/Downloads/AI_models_collapse_when_trained_on_recursively%20generated_data.pdf
+
+   Key Findings:
+   - Models accumulate errors when trained on recursively generated data
+   - Collapse occurs when models amplify their own mistakes
+   - Training on distorted distributions leads to progressive degradation
+
+---
+
+2. "Strong Model Collapse" (arXiv:2410.04840)
+   URL: https://arxiv.org/pdf/2410.04840
+
+   Key Findings:
+   - LARGER MODELS MAY AMPLIFY MODEL COLLAPSE
+   - Even 1% of AI-generated data can lead to model collapse
+   - Model starts to "amplify its own mistakes" learning from distorted distributions
+   - The extra term ζ in Theorem 1 is responsible for model collapse
+   - Hypothesis: Model collapse CANNOT be fixed by simply mixing in real data
+   - Even small amounts of low-quality synthetic data cause collapse, whereby the
+     test error of the model deviates from a perfect diagonal
+
+   Suggested Analysis Methods:
+   - Potential double descent curve for model collapse
+   - Use bias-variance decomposition to measure error from model collapse
+   - Monitor test error deviation patterns
+
+---
+
+3. "Is Model Collapse Inevitable?" (arXiv:2404.01413)
+   URL: https://arxiv.org/pdf/2404.01413
+
+   Key Findings:
+   - CRITICAL DISTINCTION: Data ACCUMULATION vs DATA REPLACEMENT
+   - ACCUMULATION of synthetic data may fix model collapse (more realistic scenario)
+   - Validation loss increases when REPLACING data but NOT when accumulating data
+   - This trend is observed in both standard ML models AND diffusion models
+
+   Technical Explanation:
+   - In DATA REPLACEMENT: Model affected by new noise from each iteration, adding
+     to effects from earlier iterations → unbounded error growth
+   - In DATA ACCUMULATION: Iteration i contributes fraction 1/i to training dataset,
+     noise effect shrinks proportional to 1/i² (due to squared error)
+   - Summability of 1/i² prevents test error from growing indefinitely
+   - Conclusion: Accumulating generated data with real data can avoid model collapse
+
+   Implication: Need to test both replacement and accumulation scenarios
+
+---
+
+4. "Theoretical Perspective on Mitigating Model Collapse" (arXiv:2502.18865)
+   URL: https://arxiv.org/pdf/2502.18865
+
+   Key Findings:
+   - Models with higher RECURSIVE STABILITY exhibit better performance after
+     self-training loops (STL)
+   - Models with higher proportion of real data are more recursively stable
+   - TRANSFORMERS are recursively stable architectures
+   - Generalization error is bounded under certain conditions
+
+   Practical Implications:
+   - Architecture choice matters for collapse resistance
+   - Real data mixing ratio is critical parameter
+   - Can theoretically bound generalization error
+   - Suggests potential mitigation strategies based on model architecture
+
+================================================================================
+                         IMPLEMENTATION COMPLETED
+================================================================================
+
+Date: February 9, 2026
+-------------------------------------------------------------------------------
+
+✓ INITIAL SETUP
+  - Created project repository
+  - Added .gitignore for Python projects
+  - Set up directory structure
+
+✓ EDM IMAGE GENERATION (generate_image.py)
+  - Implemented EDM sampler function for denoising diffusion
+  - Added batch image generation (configurable batch size)
+  - Integrated FID score calculation using Inception-v3
+  - Added comprehensive statistics logging (mean, std, covariance metrics)
+  - Created output directory management
+  - Features:
+    * Configurable hyperparameters (NUM_IMAGES, SEED_START, NUM_STEPS, BATCH_SIZE)
+    * Model path: ~/Downloads/edm-afhqv2-64x64-uncond-vp.pkl (AFHQ-v2 64x64)
+    * Reference FID: https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/afhqv2-64x64.npz
+    * Optional generation skipping (use existing images for FID calculation)
+    * Automatic logging to output/log.txt with timestamps
+  - Usage:
+    * python generate_image.py       # Generate new images + calculate FID
+    * python generate_image.py no    # Skip generation, use existing images
+
+✓ GMM MODEL COLLAPSE EXPERIMENT (gmm.py) [REWRITTEN 2026-02-17]
+  - Replaced custom GMM class with model collapse experiment script
+  - Uses scikit-learn's GaussianMixture instead of custom EM implementation
+  - Simulates iterative model collapse with varying synthetic data ratios
+  - Features:
+    * 1-D Gaussian experiment (true mean=5.0, true variance=2.0)
+    * N=1000 data points, 5000 generations per lambda value
+    * Tests lambda (synthetic fraction) values: 0.1, 0.9, 1.0
+    * Each generation: fit 1-component GMM, generate synthetic data,
+      mix with fixed real data subset
+    * Tracks variance over generations for each lambda
+  - Visualization output (gmm_variance_comparison.png):
+    * Left panel: Variance over generations for all lambda values
+    * Right panels: Distribution comparison (real vs final generation)
+      for each lambda value
+  - Directly tests DATA REPLACEMENT collapse scenario from literature
+
+✓ GMM SAMPLE GENERATION (generate_gmm_samples.py)
+  - Script to fit GMM and generate samples
+  - Saves samples, labels, training data, and fitted model
+  - Generates comprehensive statistics file
+  - Configuration:
+    * NUM_SAMPLES = 1000
+    * N_COMPONENTS = 3
+    * Output directory: gmm_out/
+  - Outputs:
+    * samples.npy: Generated samples
+    * labels.npy: Component assignments
+    * training_data.npy: Original training data
+    * gmm_model.pkl: Fitted GMM model
+    * statistics.txt: Detailed statistics
+
+✓ PROJECT DIRECTORIES CREATED
+  - output/: EDM generated images and FID logs
+  - gmm_out/: GMM samples and statistics
+  - downloads/: Model downloads
+  - edm/: EDM codebase (imported from NVIDIA's implementation)
+
+✓ GIT REPOSITORY
+  - Initial commits completed
+  - Repository structure: https://github.com/alexzhangryan/DiffusionCollapse
+  - Current branch: main
+  - Recent commits:
+    * de3d9f1: Initial commit: EDM image generation and GMM implementation
+    * e90bbfa: first commit
+
+================================================================================
+                           CURRENT PROJECT STATE
+================================================================================
+
+Environment:
+  - Python environment: /opt/miniconda3/envs/edm
+  - Platform: macOS (Darwin 23.5.0)
+  - Device: CUDA if available, else CPU
+
+Dependencies:
+  - PyTorch
+  - NumPy
+  - SciPy
+  - PIL (Pillow)
+  - tqdm
+  - pickle
+
+Models:
+  - EDM pre-trained on AFHQ-v2 64x64 dataset (unconditional, variance preserving)
+
+Key Files:
+  - generate_image.py (11,322 bytes)
+  - gmm.py (~2,400 bytes) [rewritten: model collapse experiment]
+  - generate_gmm_samples.py (4,660 bytes)
+  - gmm_variance_comparison.png [NEW: experiment output plot]
+  - README.md
+  - .gitignore
+
+New Dependencies:
+  - scikit-learn (sklearn.mixture.GaussianMixture)
+  - matplotlib
+
+================================================================================
+                              NEXT STEPS / TODO
+================================================================================
+
+[ ] RESEARCH & EXPERIMENTATION
+  - Define specific metrics for measuring diffusion model collapse
+  - Design experiments to induce and measure collapse scenarios
+  - Compare distribution quality across different sampling iterations
+  - Investigate how sampling parameters affect collapse
+  - Study mode collapse vs distribution degradation patterns
+
+  CRITICAL RESEARCH QUESTIONS:
+  - Find MINIMUM number of real data samples needed to prevent collapse
+  - Test DATA ACCUMULATION vs DATA REPLACEMENT scenarios
+  - Measure effect of synthetic data percentage (test at 1%, 5%, 10%, etc.)
+  - Investigate if collapse can be fixed by mixing in real data
+  - Study recursive stability of diffusion models
+
+[ ] CODE ENHANCEMENTS
+  - Add visualization scripts for generated images
+  - Create comparison tools between EDM samples and GMM samples
+  - Implement additional sampling algorithms
+  - Add more comprehensive evaluation metrics
+
+[ ] ANALYSIS & METRICS
+  - Generate sufficient images for reliable FID scores (50k recommended)
+  - Compare FID scores across different sampling parameters
+  - Analyze GMM component distributions vs diffusion model outputs
+
+  COLLAPSE-SPECIFIC METRICS:
+  - Implement bias-variance decomposition for measuring collapse error
+  - Track test error deviation from perfect diagonal
+  - Monitor validation loss across generations
+  - Record mean and variance of model outputs at each iteration
+  - Measure generalization error bounds
+  - Track recursive stability metrics
+
+[ ] DOCUMENTATION
+  - Write detailed README.md explaining project goals
+  - Document experimental procedures
+  - Add code comments and docstrings where needed
+  - Create usage examples and tutorials
+
+[ ] OPTIMIZATION
+  - Profile generation speed and identify bottlenecks
+  - Optimize batch processing for GPU utilization
+  - Implement distributed generation for large-scale experiments
+
+================================================================================
+                          EXPERIMENTAL LOG
+================================================================================
+
+This section will track experiments, findings, and observations.
+
+Format for entries:
+---
+Date: YYYY-MM-DD HH:MM
+Experiment: Brief description
+Parameters: Key settings used
+Results: Observations and metrics
+Notes: Additional context or insights
+---
+
+---
+Date: 2026-02-17
+Experiment: GMM variance collapse under data replacement
+Parameters:
+  - 1-D Gaussian, true mean=5.0, true variance=2.0
+  - N=1000 data points, 5000 generations
+  - Lambda values: 0.1 (10% synthetic), 0.9 (90% synthetic), 1.0 (100% synthetic)
+  - 1-component GMM, full covariance, max_iter=200, tol=1e-6
+Results:
+  - Output saved to gmm_variance_comparison.png
+  - Tests whether variance degrades over generations as synthetic data ratio increases
+  - Validates data replacement collapse predictions from literature
+Notes: First experiment in GMM toy problem series for midterm presentation.
+---
+
+================================================================================
+                              NOTES & IDEAS
+================================================================================
+
+COLLAPSE MEASUREMENT IDEAS:
+- Track FID score degradation over multiple generation iterations
+- Measure distribution diversity using inception features
+- Compare GMM-fitted distributions to diffusion outputs
+- Study how noise schedules affect collapse rate
+- Investigate whether repeated sampling from same latents causes collapse
+- Monitor covariance matrix changes across sampling iterations
+
+POTENTIAL EXPERIMENTS:
+- Iterative generation: Use outputs as training data for next iteration
+- Varying sampling steps and their effect on collapse
+- Temperature scaling and its impact on distribution quality
+- Compare unconditional vs conditional model collapse behavior
+- Study collapse in different dataset domains (faces, animals, etc.)
+
+EXPERIMENTS BASED ON LITERATURE:
+- DATA REPLACEMENT: Replace all training data with generated samples each iteration
+- DATA ACCUMULATION: Add generated samples to existing training data
+- SYNTHETIC DATA MIXING: Test 1%, 5%, 10%, 25%, 50%, 75%, 90%, 99% synthetic ratios
+- RECURSIVE STABILITY: Measure stability over multiple self-training loops
+- NOISE AMPLIFICATION: Track how errors compound across iterations
+- DISTRIBUTION SHIFT: Measure how far generated distribution deviates from real
+
+METRICS TO IMPLEMENT:
+- Mode coverage (number of distinct modes preserved)
+- Intra-class vs inter-class diversity
+- Feature space coverage analysis
+- Statistical tests for distribution shift
+- Wasserstein distance between generations
+
+THEORY-DRIVEN METRICS (from papers):
+- Bias-variance decomposition of generation error
+- Test error deviation from diagonal (perfect prediction)
+- Validation loss tracking across iterations
+- Mean and variance of feature distributions
+- Generalization error bounds
+- Recursive stability coefficient
+- 1/i² noise accumulation pattern (for data accumulation scenario)
+- ζ term (collapse-inducing term from Theorem 1)
+
+================================================================================
+                            CHANGES & UPDATES
+================================================================================
+
+Date: 2026-02-09
+Action: Created project_log.txt
+Description: Initialized project logging system to track development progress,
+experiments, and findings throughout the DiffusionCollapse research project.
+
+---
+
+Date: 2026-02-09
+Action: Added literature review and research notes
+Description: Incorporated findings from 4 key papers on model collapse:
+- AI Models Collapse When Trained on Recursively Generated Data
+- Strong Model Collapse (arXiv:2410.04840)
+- Is Model Collapse Inevitable? (arXiv:2404.01413)
+- Theoretical Perspective on Mitigating Model Collapse (arXiv:2502.18865)
+
+Key insights added:
+- Data accumulation vs replacement strategies
+- Recursive stability as key factor
+- Bias-variance decomposition for measuring collapse
+- Critical finding: even 1% synthetic data can cause collapse
+- Potential mitigation through data accumulation rather than replacement
+
+Updated research focus to include finding minimum real data samples needed
+to prevent collapse, and emphasized GMM toy problem approach before scaling
+to diffusion models.
+
+---
+
+Date: 2026-02-17
+Action: Rewrote gmm.py — model collapse experiment
+Description: Replaced the custom GaussianMixtureModel class with a focused
+model collapse experiment script. The new script:
+- Uses scikit-learn's GaussianMixture for fitting (replacing custom EM)
+- Implements iterative generation loop over 5000 generations
+- Tests 3 lambda values (0.1, 0.9, 1.0) controlling synthetic data fraction
+- Lambda=0.1: 10% synthetic, 90% real data retained each generation
+- Lambda=0.9: 90% synthetic, 10% real data retained
+- Lambda=1.0: 100% synthetic, no real data (pure replacement)
+- Tracks variance over generations to measure distribution collapse
+- Generates combined visualization (gmm_variance_comparison.png) with
+  variance trajectories and distribution comparisons
+- Directly implements the DATA REPLACEMENT scenario from literature review
+  (paper: "Is Model Collapse Inevitable?" arXiv:2404.01413)
+
+This marks the transition from Phase 1 setup to active experimentation on
+the GMM toy problem for the midterm presentation.
+
+---
+
+[Future updates will be appended here]
+
+================================================================================
+                              END OF LOG
+================================================================================
+Last Updated: February 17, 2026 (GMM model collapse experiment implemented)
