@@ -394,9 +394,91 @@ the GMM toy problem for the midterm presentation.
 
 ---
 
+---
+
+Date: 2026-03-06
+Action: Built full EDM diffusion model collapse pipeline + CHTC deployment setup
+Description: Implemented the complete server-side experiment pipeline for running
+the EDM model collapse experiment on CHTC (HTCondor). The following files were
+created or updated:
+
+New files:
+- diffusion_model.py: Main experiment script. Trains EDM on CIFAR-10 for 50
+  generations (lambda=1, full replacement). Tracks FID and pixel variance per
+  generation. Supports --local flag for quick pipeline verification.
+- diffusion.sh: Executable entry point. Auto-unpacks experiment.tar.gz when
+  running on CHTC, converts dataset to EDM zip format if needed, generates FID
+  reference stats if missing, then runs diffusion_model.py.
+- diffusion.sub: HTCondor submit file. Uses Docker container universe, requests
+  1 GPU (>=8GB VRAM), 4 CPUs, 16GB RAM, 50GB disk.
+- Dockerfile: Container image based on pytorch/pytorch:1.12.1-cuda11.3-cudnn8-runtime.
+  Installs all Python dependencies matching edm/environment.yml.
+
+Updated files:
+- .gitignore: Added dataset/ to prevent large training data from being committed.
+- README.md: Updated project structure, installation instructions, and added
+  full 5-step CHTC deployment guide.
+
+Git history fix:
+- dataset/ files (cifar-10-python.tar.gz, cifar10-32x32.zip) were previously
+  committed and required git rm --cached + history squash before pushing.
+
+================================================================================
+                         CHTC DEPLOYMENT INSTRUCTIONS
+================================================================================
+
+HOW TO RUN THE EXPERIMENT ON CHTC (HTCondor)
+---------------------------------------------
+
+PREREQUISITES (one-time local setup):
+  - Docker installed and logged in to Docker Hub
+  - edm/ cloned: git clone https://github.com/NVlabs/edm.git
+  - dataset/ populated with raw CIFAR-10 images
+  - Python environment active (conda activate edm)
+
+STEP 1 — Convert CIFAR-10 to EDM zip format:
+  python edm/dataset_tool.py --source=dataset/ --dest=dataset/cifar10-32x32.zip
+
+STEP 2 — Generate FID reference statistics (requires internet):
+  torchrun --standalone --nproc_per_node=1 edm/fid.py ref \
+      --data=dataset/cifar10-32x32.zip \
+      --dest=cifar10-32x32.npz
+
+STEP 3 — Build and push Docker container:
+  docker build -t <dockerhub_username>/edm-experiment:latest .
+  docker push <dockerhub_username>/edm-experiment:latest
+  (Then update container_image in diffusion.sub with your username)
+
+STEP 4 — Bundle everything into a tarball:
+  tar -czf experiment.tar.gz \
+      edm/ \
+      dataset/cifar10-32x32.zip \
+      cifar10-32x32.npz \
+      diffusion_model.py \
+      diffusion.sh
+
+STEP 5 — Upload to CHTC and submit:
+  scp experiment.tar.gz diffusion.sub <user>@submit.chtc.wisc.edu:~/diffusion/
+  ssh <user>@submit.chtc.wisc.edu
+  cd ~/diffusion
+  mkdir -p logs
+  condor_submit diffusion.sub
+
+STEP 6 — Monitor the job:
+  condor_q                               # check job status
+  tail -f logs/job_<ClusterID>.out       # stream stdout live
+
+Output files are transferred back automatically to output/ when job completes:
+  output/results.json          — FID and pixel variance per generation
+  output/collapse_metrics.png  — Summary plot
+
+LOCAL TEST (verify pipeline without GPU):
+  ./diffusion.sh --local
+  (Uses 200 images/generation, 1 Mimg training — completes in minutes)
+
 [Future updates will be appended here]
 
 ================================================================================
                               END OF LOG
 ================================================================================
-Last Updated: February 17, 2026 (GMM model collapse experiment implemented)
+Last Updated: 2026-03-06 (EDM diffusion collapse pipeline + CHTC deployment)
