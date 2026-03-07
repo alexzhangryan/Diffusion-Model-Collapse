@@ -5,6 +5,9 @@ edm/
 output/
 gmm_out/
 
+# Training data
+dataset/
+
 # Python
 __pycache__/
 *.py[cod]
