@@ -8,6 +8,9 @@ gmm_out/
 # Training data
 dataset/
 
+# Experiment bundle (large tarball for CHTC upload)
+experiment.tar.gz
+
 # Python
 __pycache__/
 *.py[cod]

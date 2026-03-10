@@ -15,6 +15,9 @@ container_image         = docker://<dockerhub_username>/edm-experiment:latest
 executable              = diffusion.sh
 arguments               =
 
+# Force unbuffered Python output so logs appear in .out file in real time
+environment             = "PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1"
+
 # Transfer input files into the job's working directory
 transfer_input_files    = experiment.tar.gz
 should_transfer_files   = YES
@@ -38,5 +41,9 @@ requirements            = (Target.CUDACapability >= 6.0) && (Target.CUDAGlobalMe
 log                     = logs/job_$(Cluster).log
 output                  = logs/job_$(Cluster)_$(Process).out
 error                   = logs/job_$(Cluster)_$(Process).err
+
+# Stream output to log files in real time instead of buffering until job ends
+stream_output           = True
+stream_error            = True
 
 queue 1

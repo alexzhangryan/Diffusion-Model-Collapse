@@ -58,11 +58,11 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 # Default configuration
 # ---------------------------------------------------------------------------
-N_GENERATIONS     = 50
+N_GENERATIONS     = 10
 
 # Full-scale (server)
 N_IMAGES_FULL     = 50_000   # images to generate per generation
-DURATION_FULL     = 200.0    # training duration in million images (Mimg)
+DURATION_FULL     = 50.0     # training duration in million images (Mimg)
 BATCH_FULL        = 512
 
 # Local test

@@ -10,6 +10,10 @@
 
 set -euo pipefail
 
+# Force unbuffered Python output so logs appear in HTCondor's .out file in real time
+export PYTHONUNBUFFERED=1
+export PYTHONFAULTHANDLER=1
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -61,10 +65,10 @@ echo ">>> [3/3] Starting diffusion model collapse experiment..."
 
 if [ "$LOCAL_FLAG" = "--local" ]; then
     echo "    Mode: LOCAL TEST (200 images, 1 Mimg training)"
-    python diffusion_model.py --local
+    python -u diffusion_model.py --local
 else
-    echo "    Mode: SERVER (50 000 images, 200 Mimg training)"
-    python diffusion_model.py
+    echo "    Mode: SERVER (50 000 images/gen, 50 Mimg training, 10 generations, ~12-15h)"
+    python -u diffusion_model.py
 fi
 
 echo ""
