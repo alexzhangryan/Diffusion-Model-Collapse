@@ -10,7 +10,7 @@
 #   4. Submit: condor_submit diffusion.sub
 
 universe                = container
-container_image         = docker://<dockerhub_username>/edm-experiment:latest
+container_image         = docker://genjigod/edm-experiment:latest
 
 executable              = diffusion.sh
 arguments               =

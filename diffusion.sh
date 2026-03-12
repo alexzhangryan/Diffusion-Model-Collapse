@@ -14,9 +14,6 @@ set -euo pipefail
 export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
-
 LOCAL_FLAG="${1:-}"
 
 # ---------------------------------------------------------------------------
@@ -61,6 +58,7 @@ fi
 # ---------------------------------------------------------------------------
 # Step 3: Run the model-collapse experiment
 # ---------------------------------------------------------------------------
+mkdir -p output
 echo ">>> [3/3] Starting diffusion model collapse experiment..."
 
 if [ "$LOCAL_FLAG" = "--local" ]; then

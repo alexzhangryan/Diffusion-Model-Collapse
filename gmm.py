@@ -35,9 +35,20 @@ if __name__ == "__main__":
     # --- Configuration ---
     N = 1000  # Number of real data points
     N_GENERATIONS = 5000
-    LAMBDA_VALUES = [0.1, 0.3, 0.5, 0.9, 1.0]
+    LAMBDA_VALUES = [0, 0.1, 0.3, 0.5, 0.9, 1]
     ACCUMULATE = False  # True: append λ*N synthetic points; False: substitute
-    DIM = 2  # 1: 1D Gaussian;  2: 2D multi-modal GMM
+    DIM = 1  # 1: 1D Gaussian;  2: 2D multi-modal GMM
+
+    # --- Recursive lambda search ---
+    # Round 1: evaluate 4 candidates evenly spaced in [0, 1].
+    # Each candidate runs for TUNE_EVAL_GENS generations; score = lambda * (mean_var / initial_var).
+    # Best candidate becomes the centre of a narrower range for the next round.
+    # Repeats for TUNE_ROUNDS rounds, converging on the highest lambda with least collapse.
+    TUNE_LAMBDA = True
+    TUNE_ROUNDS = 5
+    TUNE_N_CANDIDATES = 4
+    TUNE_EVAL_GENS = 200    # generations to evaluate each candidate
+    TUNE_THRESHOLD = 0.90   # variance must stay >= this fraction of initial variance
 
     # --- 1D true distribution (used when DIM=1) ---
     TRUE_MEAN_1D = np.array([5.0])
@@ -111,10 +122,13 @@ if __name__ == "__main__":
                 )
 
             # Generate and update dataset
-            synthetic_data, _ = gmm.sample(n_synthetic)
-            if ACCUMULATE:
+            if n_synthetic == 0:
+                current_data = real_data.copy()
+            elif ACCUMULATE:
+                synthetic_data, _ = gmm.sample(n_synthetic)
                 current_data = np.vstack([current_data, synthetic_data])
             else:
+                synthetic_data, _ = gmm.sample(n_synthetic)
                 current_data = np.vstack([real_subset, synthetic_data])
 
             if gen % 10 == 0 or gen == N_GENERATIONS - 1:
@@ -144,7 +158,7 @@ if __name__ == "__main__":
         )
     ax_var.set_xlabel("Generation")
     ax_var.set_ylabel("Variance" if DIM == 1 else "Mean variance (trace / d)")
-    ax_var.set_ylim(bottom=0)
+    ax_var.set_ylim(0, 4)
     ax_var.set_title(f"Variance over Generations  (N = {N} data points)")
     ax_var.legend()
     fig_var.tight_layout()
@@ -256,5 +270,80 @@ if __name__ == "__main__":
     fig_dist.tight_layout()
     fig_dist.savefig("gmm_distributions.png", dpi=150)
     print("  -> Saved gmm_distributions.png")
+
+    # ---------------------------------------------------------------------------
+    # Recursive lambda search
+    # ---------------------------------------------------------------------------
+    if TUNE_LAMBDA:
+        print("\n--- Recursive lambda search ---", flush=True)
+
+        initial_var = float(real_data.var()) if DIM == 1 else float(np.trace(np.cov(real_data.T)) / DIM)
+
+        def eval_lambda(cand_lam):
+            """Run cand_lam for TUNE_EVAL_GENS generations; return mean variance."""
+            data = real_data.copy()
+            n_syn = int(N * cand_lam)
+            real_sub = real_data[: N - n_syn].copy() if n_syn > 0 and not ACCUMULATE else None
+            vars_run = []
+            for _ in range(TUNE_EVAL_GENS):
+                if DIM == 1:
+                    vars_run.append(float(data.var()))
+                else:
+                    vars_run.append(float(np.trace(np.cov(data.T)) / DIM))
+                g = GaussianMixture(n_components=n_fit, max_iter=200, tol=1e-6, covariance_type="full")
+                g.fit(data)
+                if n_syn == 0:
+                    data = real_data.copy()
+                elif ACCUMULATE:
+                    syn, _ = g.sample(n_syn)
+                    data = np.vstack([data, syn])
+                else:
+                    syn, _ = g.sample(n_syn)
+                    data = np.vstack([real_sub, syn])
+            return vars_run  # return full trace, not just mean
+
+        lo, hi = 0.0, 1.0
+        round_history = []  # list of (candidates, scores, best_lam) per round
+
+        for round_i in range(TUNE_ROUNDS):
+            candidates = list(np.linspace(lo, hi, TUNE_N_CANDIDATES))
+            scores = []
+            for cand_lam in candidates:
+                vars_run = eval_lambda(cand_lam)
+                mse = float(np.mean((np.array(vars_run) - initial_var) ** 2))
+                # Score: highest lambda with lowest variance MSE; avoid div-by-zero
+                score = cand_lam / (mse + 1e-9)
+                scores.append(score)
+                print(f"  round={round_i+1}  λ={cand_lam:.4f}  mse={mse:.6f}  score={score:.4f}", flush=True)
+
+            best_idx = int(np.argmax(scores))
+            best_lam = candidates[best_idx]
+            round_history.append((candidates, scores, best_lam))
+
+            # Narrow range to neighbours of best candidate
+            lo = candidates[max(0, best_idx - 1)]
+            hi = candidates[min(TUNE_N_CANDIDATES - 1, best_idx + 1)]
+
+            print(f"  -> round {round_i+1} best: λ={best_lam:.4f}  new range=[{lo:.4f}, {hi:.4f}]\n", flush=True)
+
+        print(f"\n  -> Final best lambda = {best_lam:.4f}")
+
+        # --- Plot: score vs lambda for each round ---
+        colors = plt.cm.viridis(np.linspace(0.15, 0.9, TUNE_ROUNDS))
+        fig_tune, ax_tune = plt.subplots(figsize=(8, 5))
+        for round_i, (cands, scores, best) in enumerate(round_history):
+            ax_tune.plot(cands, scores, marker="o", color=colors[round_i], label=f"Round {round_i+1}")
+            ax_tune.axvline(best, color=colors[round_i], linestyle=":", alpha=0.5)
+        ax_tune.set_xlabel("λ")
+        ax_tune.set_ylabel("Score  (λ / MSE(sample variance))")
+        ax_tune.set_xlim(0, 1)
+        ax_tune.set_title(
+            f"Recursive λ Search  (N={N}, {TUNE_EVAL_GENS} eval gens/candidate)\n"
+            f"Best λ = {best_lam:.4f}"
+        )
+        ax_tune.legend(fontsize=8)
+        fig_tune.tight_layout()
+        fig_tune.savefig("gmm_tune_lambda.png", dpi=150)
+        print("  -> Saved gmm_tune_lambda.png")
 
     plt.show()
