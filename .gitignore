@@ -8,8 +8,8 @@ gmm_out/
 # Training data
 dataset/
 
-# Experiment bundle (large tarball for CHTC upload)
-experiment.tar.gz
+# Experiment bundles (large tarballs for CHTC upload)
+*.tar.gz
 
 # Python
 __pycache__/
