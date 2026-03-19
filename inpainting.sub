@@ -1,0 +1,38 @@
+# inpainting.sub — HTCondor submit file for the EDM inpainting experiment.
+#
+# Before submitting:
+#   1. Bundle your code and data:
+#        tar -czf inpainting.tar.gz edm/ dataset/ cifar10-32x32.npz inpainting.py inpainting.sh
+#   2. Copy to CHTC:
+#        scp inpainting.tar.gz apryan3@ap2001.chtc.wisc.edu:~/
+#   3. On CHTC: condor_submit inpainting.sub
+
+universe                = container
+container_image         = docker://genjigod/edm-experiment:latest
+
+executable              = inpainting.sh
+arguments               =
+
+environment             = "PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1"
+
+transfer_input_files    = inpainting.tar.gz
+should_transfer_files   = YES
+when_to_transfer_output = ON_EXIT
+
+transfer_output_files   = output/
+
+request_cpus            = 4
+request_memory          = 16GB
+request_disk            = 50GB
+request_gpus            = 1
+
+requirements            = (Target.CUDACapability >= 6.0) && (Target.CUDAGlobalMemoryMb >= 8192)
+
+log                     = logs/inpainting_$(Cluster).log
+output                  = logs/inpainting_$(Cluster)_$(Process).out
+error                   = logs/inpainting_$(Cluster)_$(Process).err
+
+stream_output           = True
+stream_error            = True
+
+queue 1

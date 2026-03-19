@@ -58,10 +58,10 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 # Default configuration
 # ---------------------------------------------------------------------------
-N_GENERATIONS     = 10
+N_GENERATIONS     = 5
 
 # Full-scale (server)
-N_IMAGES_FULL     = 50_000   # images to generate per generation
+N_IMAGES_FULL     = 10_000   # images to generate per generation
 DURATION_FULL     = 25.0     # training duration in million images (Mimg)
 BATCH_FULL        = 512
 
@@ -337,7 +337,8 @@ def main():
         #    and training checkpoints (keep only the .pkl used for generation)
         shutil.rmtree(synth_dir, ignore_errors=True)
         for pt_file in train_dir.glob("training-state-*.pt"):
-            pt_file.unlink(missing_ok=True)
+            if pt_file.exists():
+                pt_file.unlink()
 
         # Rotate dataset: next generation trains on this generation's output
         current_data_zip = next_data_zip
