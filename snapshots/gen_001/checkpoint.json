@@ -1,0 +1,19 @@
+{
+  "generation": 1,
+  "results": [
+    {
+      "generation": 0,
+      "lambda": 0.5,
+      "fid": 370.51,
+      "pixel_variance": 10159.3525390625,
+      "masked_mse": 20360.14435546875
+    },
+    {
+      "generation": 1,
+      "lambda": 0.5,
+      "fid": 375.156,
+      "pixel_variance": 10159.7568359375,
+      "masked_mse": 20355.7168359375
+    }
+  ]
+}

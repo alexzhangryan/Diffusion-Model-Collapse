@@ -19,6 +19,9 @@ LOCAL_FLAG="${1:-}"
 if [ -f "inpainting.tar.gz" ] && [ ! -d "edm" ]; then
     echo ">>> [0/3] Unpacking inpainting.tar.gz..."
     tar -xzf inpainting.tar.gz
+    echo "    PWD: $(pwd)"
+    echo "    Contents after extraction:"
+    ls -la
 fi
 
 # Always ensure output dir exists before HTCondor tries to transfer it

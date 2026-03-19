@@ -38,7 +38,7 @@ import tqdm
 # ---------------------------------------------------------------------------
 
 def load_png_batch(paths, device: torch.device) -> torch.Tensor:
-    """Load a list of PNG paths → [B, C, H, W] float32 in [-1, 1]."""
+    """Load a list of PNG paths -> [B, C, H, W] float32 in [-1, 1]."""
     arrs = [np.asarray(PIL.Image.open(p).convert("RGB"), dtype=np.float32)
             for p in paths]
     t = torch.from_numpy(np.stack(arrs)).to(device)   # [B, H, W, C]
@@ -100,7 +100,7 @@ def heun_inpaint(
         + idx / max(steps - 1, 1)
         * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))
     ) ** rho
-    sigmas = torch.cat([sigmas, sigmas.new_zeros(1)])  # append σ=0
+    sigmas = torch.cat([sigmas, sigmas.new_zeros(1)])  # append ?=0
 
     # Start from pure noise
     x = torch.randn_like(real) * sigmas[0]
@@ -109,15 +109,15 @@ def heun_inpaint(
         t_cur  = sigmas[i].float()
         t_next = sigmas[i + 1].float()
 
-        # ── Replacement: paste known region with correctly-noised real image ──
+        # -- Replacement: paste known region with correctly-noised real image --
         x = mask * (real + torch.randn_like(real) * t_cur) + (1 - mask) * x
 
-        # ── First-order Euler step ────────────────────────────────────────────
+        # -- First-order Euler step --------------------------------------------
         denoised_cur = net(x, t_cur.expand(B), class_labels)
         d_cur = (x - denoised_cur) / t_cur
         x_next = x + (t_next - t_cur) * d_cur
 
-        # ── Heun correction (skip at final step where t_next = 0) ────────────
+        # -- Heun correction (skip at final step where t_next = 0) ------------
         if t_next > 0:
             x_next = (mask * (real + torch.randn_like(real) * t_next)
                       + (1 - mask) * x_next)
@@ -175,7 +175,7 @@ def main():
     src_paths = sorted(Path(args.images).rglob("*.png"))
     if args.n:
         src_paths = src_paths[: args.n]
-    print(f"[inpaint] {len(src_paths)} source images → {args.outdir}",
+    print(f"[inpaint] {len(src_paths)} source images -> {args.outdir}",
           flush=True)
 
     out_root = Path(args.outdir)
@@ -202,7 +202,7 @@ def main():
             rel = Path(src_p).relative_to(Path(args.images))
             save_composite(composites[i], out_root / rel)
 
-    print(f"[inpaint] done — {len(src_paths)} composites saved.", flush=True)
+    print(f"[inpaint] done ? {len(src_paths)} composites saved.", flush=True)
 
 
 if __name__ == "__main__":
