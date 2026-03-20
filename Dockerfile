@@ -1,4 +1,3 @@
-# Base image: PyTorch 1.12.1 with CUDA 11.3 (matches environment.yml)
 FROM pytorch/pytorch:1.12.1-cuda11.3-cudnn8-runtime
 
 # Install system dependencies

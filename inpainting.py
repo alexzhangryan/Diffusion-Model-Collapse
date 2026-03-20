@@ -4,19 +4,24 @@ Inpainting model-collapse experiment using EDM on CIFAR-10.
 
 Each generation:
   1. Train an EDM model on the previous generation's composite images
-     (real CIFAR-10 for generation 0).  Training uses COMPLETE images ?
-     no masking ? so the model learns the full image distribution.
-  2. Run conditional inpainting: given the real left half of each CIFAR-10
-     image, the trained model fills in the right half using replacement-based
-     sampling (RePaint style).  Output = real_left | synthetic_right.
-  3. Measure quality of the inpainted region:
-       - MSE between generated and original images (right half only)
+     (real CIFAR-10 for generation 0).  Training uses COMPLETE images —
+     no masking — so the model learns the full image distribution.
+  2. Run conditional inpainting: a randomly-placed window of width lam*W
+     is masked in each conditioning image.  The model fills in the masked
+     region; the rest is replaced with the real pixel values (RePaint style).
+     Output = real_unmasked_region | model_generated_masked_region.
+  3. Measure quality:
+       - MSE between generated composites and original images (full image)
        - Pixel variance of the composite images
        - FID vs. real CIFAR-10
   4. The composite images become the training set for the next generation.
 
-LAMBDA controls what fraction of each image width is inpainted (right side).
-  LAMBDA = 0.5  -> right half is inpainted  (default)
+All 50k CIFAR-10 training images are used for both training and conditioning
+each generation.  No data-leak concern: the distribution shifts from real to
+synthetic, so the model cannot reproduce the exact originals regardless.
+
+LAMBDA controls the fraction of image width that is randomly masked.
+  LAMBDA = 0.5  -> half the image is inpainted  (default)
 
 Usage:
   python inpainting.py                  # server run
@@ -45,14 +50,13 @@ LAMBDA = 0.5  # fraction of image width to mask (right side)
 N_GENERATIONS = 10
 
 # Full-scale (server)
-N_IMAGES_FULL = 10_000
-DURATION_FULL = 25.0  # Mimg
-BATCH_FULL = 512
+N_IMAGES_FULL = 50_000   # use all 50k CIFAR-10 training images
+DURATION_FULL = 25.0     # Mimg
+BATCH_FULL    = 512
 
-# Local test
-N_IMAGES_LOCAL = 100
-DURATION_LOCAL = 0.005
-BATCH_LOCAL = 32
+# Local: same parameters as server; snapshots saved every ~1 hr for easy resume
+SNAP_LOCAL  = 150   # ticks between EDM snapshots (~1 hr on RTX 4080 @ ~28 s/tick)
+SNAP_SERVER = 500
 
 # Paths
 EDM_DIR = Path("edm")
@@ -74,6 +78,24 @@ def run(cmd: list, **kwargs):
     printable = " ".join(str(c) for c in cmd)
     print(f"\n>>> {printable}\n", flush=True)
     subprocess.run([str(c) for c in cmd], check=True, **kwargs)
+
+
+def assert_cuda_available():
+    """Fail fast if no GPU is visible — prevents silent CPU fallback and OOM."""
+    probe = subprocess.run(
+        [sys.executable, "-c",
+         "import torch, sys; ok = torch.cuda.is_available(); "
+         "print(f'CUDA={ok} devices={torch.cuda.device_count()}'); "
+         "sys.exit(0 if ok else 1)"],
+        capture_output=True, text=True,
+    )
+    print(f"  [GPU check] {probe.stdout.strip()}", flush=True)
+    if probe.returncode != 0:
+        raise RuntimeError(
+            f"No GPU visible before training — aborting to avoid CPU OOM.\n"
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}\n"
+            f"{probe.stderr.strip()}"
+        )
 
 
 def unpack_tar(tar_path: str):
@@ -165,9 +187,9 @@ def copy_n_images(src_dir: Path, dst_dir: Path, n: int, offset: int = 0):
         (dst_dir / "dataset.json").write_text(json.dumps(meta))
 
 
-def compute_masked_mse(generated_dir: Path, original_dir: Path, lam: float) -> float:
+def compute_image_mse(generated_dir: Path, original_dir: Path) -> float:
     """
-    MSE between generated and original images, evaluated only on the masked region.
+    MSE between generated composites and original images over the full image.
     Pairs images by sorted filename. Returns NaN if no pairs found.
     """
     gen_paths = sorted(generated_dir.rglob("*.png"))
@@ -180,9 +202,7 @@ def compute_masked_mse(generated_dir: Path, original_dir: Path, lam: float) -> f
     for gp, op in zip(gen_paths[:n], orig_paths[:n]):
         gen_arr = np.asarray(Image.open(gp).convert("RGB"), dtype=np.float32)
         orig_arr = np.asarray(Image.open(op).convert("RGB"), dtype=np.float32)
-        mask_start = int(IMAGE_SIZE * (1.0 - lam))
-        diff = gen_arr[:, mask_start:, :] - orig_arr[:, mask_start:, :]
-        squared_errors.append(float(np.mean(diff**2)))
+        squared_errors.append(float(np.mean((gen_arr - orig_arr) ** 2)))
 
     return float(np.mean(squared_errors))
 
@@ -201,27 +221,21 @@ def compute_fid(
     images_dir: Path,
     ref_npz: Path,
     batch: int,
-    local: bool = False,
     n_images: int = 50000,
 ) -> float:
-    launcher = (
-        [sys.executable]
-        if local
-        else ["torchrun", "--standalone", "--nproc_per_node=1"]
-    )
-    dist_env = {
-        **os.environ,
-        "MASTER_ADDR": "127.0.0.1",
-        "MASTER_PORT": "29501",
-        "RANK": "0",
-        "WORLD_SIZE": "1",
-        "LOCAL_RANK": "0",
+    # Use plain python — same reasoning as train_model (avoid NCCL in containers).
+    # Do NOT set RANK/WORLD_SIZE so EDM skips distributed init entirely.
+    dist_env = dict(os.environ)
+    dist_env.update({
         "USE_LIBUV": "0",
         "KMP_DUPLICATE_LIB_OK": "TRUE",
-    }
+    })
+    dist_env.pop("RANK", None)
+    dist_env.pop("WORLD_SIZE", None)
+    dist_env.pop("LOCAL_RANK", None)
     dist_env.pop("HOSTNAME", None)  # prevent docker hostname being used as MASTER_ADDR
     result = subprocess.run(
-        launcher
+        [sys.executable]
         + [
             EDM_DIR / "fid.py",
             "calc",
@@ -259,32 +273,31 @@ def train_model(
     data_zip: Path, out_dir: Path, duration: float, batch: int, local: bool
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
-    launcher = (
-        [sys.executable]
-        if local
-        else ["torchrun", "--standalone", "--nproc_per_node=1"]
-    )
-    tick = "1" if local else "10"
-    snap = "1" if local else "500"
-    cmd = launcher + [
-        EDM_DIR / "train.py",
-        "--outdir",
-        out_dir,
-        "--data",
-        data_zip,
+    # Always use plain python — torchrun sets RANK/WORLD_SIZE which forces EDM
+    # to init NCCL, and NCCL fails inside HTCondor containers.  With plain
+    # python those env-vars are absent so EDM runs single-process without
+    # touching NCCL at all.
+    snap = str(SNAP_LOCAL if local else SNAP_SERVER)
+    cmd = [sys.executable, EDM_DIR / "train.py",
+        "--outdir", out_dir,
+        "--data",   data_zip,
         "--cond=1",
         "--arch=ddpmpp",
         "--precond=vp",
-        "--duration",
-        str(duration),
-        "--batch",
-        str(batch),
+        "--duration", str(duration),
+        "--batch",    str(batch),
         "--nosubdir",
-        f"--tick={tick}",
+        "--tick=10",
         f"--snap={snap}",
+        "--fp16=1",
+        "--workers=4",
     ]
-    if not local:
-        cmd += ["--fp16=1", "--workers=4"]
+    # Resume mid-generation if a training state file exists (local restarts).
+    resume_states = sorted(out_dir.glob("training-state-*.pt"))
+    if resume_states:
+        cmd += ["--resume", str(resume_states[-1])]
+        print(f"  [resume] Resuming training from {resume_states[-1]}", flush=True)
+    assert_cuda_available()
     run(cmd)
 
 
@@ -370,9 +383,9 @@ def main():
 
     local = args.local
     lam = args.lam
-    n_images = N_IMAGES_LOCAL if local else N_IMAGES_FULL
-    duration = DURATION_LOCAL if local else DURATION_FULL
-    batch = BATCH_LOCAL if local else BATCH_FULL
+    n_images = N_IMAGES_FULL
+    duration = DURATION_FULL
+    batch = BATCH_FULL
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -384,31 +397,19 @@ def main():
     print(f"  Generations            : {args.generations}")
     print(f"  Images/gen             : {n_images}")
     print(f"  Train duration         : {duration} Mimg")
-    print(f"  Mode                   : {'LOCAL TEST' if local else 'SERVER'}")
+    print(f"  Mode                   : {'LOCAL (snap every ~1 hr)' if local else 'SERVER'}")
     print(f"{'='*60}\n", flush=True)
 
-    # Extract CIFAR-10 train images (used as gen-0 training data)
+    # Extract all 50k CIFAR-10 training images once.
+    # The same set is used for both training (gen 0) and conditioning every gen.
+    # No data-leak concern: the distribution shifts each generation, so the
+    # model cannot reproduce originals exactly regardless of overlap.
     real_images_dir = OUTPUT_DIR / "real_images_train"
     if not real_images_dir.exists():
         print("  Extracting CIFAR-10 train images...", flush=True)
         real_images_dir.mkdir(parents=True)
-        run(
-            [
-                sys.executable,
-                EDM_DIR / "dataset_tool.py",
-                "--source",
-                CIFAR10_ZIP,
-                "--dest",
-                real_images_dir,
-            ]
-        )
-
-    # Conditioning images: second 10k slice from the train zip ? never used
-    # for training, so the model cannot have memorised their right halves.
-    test_images_dir = OUTPUT_DIR / "real_images_cond"
-    if not test_images_dir.exists():
-        print("  Slicing conditioning images from CIFAR-10 train set...", flush=True)
-        copy_n_images(real_images_dir, test_images_dir, n_images, offset=n_images)
+        run([sys.executable, EDM_DIR / "dataset_tool.py",
+             "--source", CIFAR10_ZIP, "--dest", real_images_dir])
 
     last_done, current_synth_dir, results = load_latest_generation_snapshot()
     start_gen = last_done + 1
@@ -420,15 +421,19 @@ def main():
         print(f"Generation {gen} / {args.generations - 1}  (lam={lam:.2f})")
         print(f"{'-'*50}", flush=True)
 
-        gen_dir = OUTPUT_DIR / f"gen_{gen:03d}"
+        gen_dir   = OUTPUT_DIR / f"gen_{gen:03d}"
         train_dir = gen_dir / "training"
-        stage_dir = gen_dir / "train_staging"  # n_images copied here for packing
+        stage_dir = gen_dir / "train_staging"
         synth_dir = gen_dir / "synthetic_images"
 
+        # Conditioning always uses the full 50k real images every generation.
+        cond_dir = real_images_dir
+
         # --- 1. Select source images for training ---
-        # Gen 0: real CIFAR-10.  Gen 1+: composites from previous generation.
+        # Gen 0: real images.  Gen 1+: composites from previous generation.
         source_dir = current_synth_dir if current_synth_dir else real_images_dir
         print(f"  [1/4] Training source  : {source_dir}", flush=True)
+        print(f"  [1/4] Conditioning on  : {cond_dir}", flush=True)
 
         # --- 2. Pack n_images complete (unmasked) images for EDM training ---
         train_zip = gen_dir / "train_data.zip"
@@ -438,46 +443,40 @@ def main():
         shutil.rmtree(stage_dir, ignore_errors=True)
 
         # --- 3. Train on complete images ---
-        print(
-            f"  [3/4] Training (duration={duration} Mimg, batch={batch})...", flush=True
-        )
+        print(f"  [3/4] Training (duration={duration} Mimg, batch={batch})...", flush=True)
         train_model(train_zip, train_dir, duration, batch, local)
         network_pkl = find_latest_snapshot(train_dir)
         print(f"  Checkpoint: {network_pkl}", flush=True)
 
         # --- 4. Conditional inpainting: real left half + model right half ---
         print(f"  [4/4] Inpainting {n_images} images (lam={lam:.2f})...", flush=True)
-        generate_inpainted_images(
-            network_pkl, test_images_dir, synth_dir, n_images, lam, batch
-        )
+        generate_inpainted_images(network_pkl, cond_dir, synth_dir, n_images, lam, batch)
         # Propagate labels so next generation can train with --cond=1
-        src_json = test_images_dir / "dataset.json"
+        src_json = cond_dir / "dataset.json"
         if src_json.exists():
             shutil.copy2(src_json, synth_dir / "dataset.json")
 
-        # --- 6. Metrics ---
-        print(f"  [6/6] Computing metrics...", flush=True)
+        # --- 5. Metrics ---
+        print(f"  [5/5] Computing metrics...", flush=True)
 
         pixel_var = compute_pixel_variance(synth_dir)
+        image_mse = compute_image_mse(synth_dir, cond_dir)
+        fid       = compute_fid(synth_dir, FID_REF_NPZ, batch, n_images)
+
         print(f"  Pixel variance : {pixel_var:.4f}", flush=True)
-
-        # MSE on the masked region vs real images
-        masked_mse = compute_masked_mse(synth_dir, test_images_dir, lam)
-        print(f"  Masked MSE     : {masked_mse:.4f}", flush=True)
-
-        fid = compute_fid(synth_dir, FID_REF_NPZ, batch, local, n_images)
+        print(f"  Image MSE      : {image_mse:.4f}", flush=True)
         print(f"  FID            : {fid:.4f}", flush=True)
 
         record = {
-            "generation": gen,
-            "lambda": lam,
-            "fid": fid,
+            "generation":     gen,
+            "lambda":         lam,
+            "fid":            fid,
             "pixel_variance": pixel_var,
-            "masked_mse": masked_mse,
+            "image_mse":      image_mse,
         }
         results.append(record)
         print(
-            f"\n  OK Gen {gen}: FID={fid:.2f}  var={pixel_var:.4f}  masked_mse={masked_mse:.4f}",
+            f"\n  OK Gen {gen}: FID={fid:.2f}  var={pixel_var:.4f}  image_mse={image_mse:.4f}",
             flush=True,
         )
 
@@ -486,11 +485,12 @@ def main():
 
         save_generation_snapshot(gen, synth_dir, results)
 
-        # Clean up large files
+        # Clean up large files; keep training-state on local for mid-gen resume
         train_zip.unlink(missing_ok=True)
-        for pt in train_dir.glob("training-state-*.pt"):
-            if pt.exists():
-                pt.unlink()
+        if not local:
+            for pt in train_dir.glob("training-state-*.pt"):
+                if pt.exists():
+                    pt.unlink()
 
         current_synth_dir = synth_dir
 
@@ -498,24 +498,11 @@ def main():
     # Final metrics summary
     # ---------------------------------------------------------------------------
     print(f"\n{'='*60}", flush=True)
-    print(f"{'Gen':<5} {'Source':<20} {'FID':>8} {'PixelVar':>10} {'MaskedMSE':>12}")
-    print(f"{'-'*5} {'-'*20} {'-'*8} {'-'*10} {'-'*12}")
+    print(f"{'Gen':<5} {'Source':<20} {'FID':>8} {'PixelVar':>10} {'ImageMSE':>10}")
+    print(f"{'-'*5} {'-'*20} {'-'*8} {'-'*10} {'-'*10}")
     for r in results:
-        source = (
-            "real CIFAR-10"
-            if r["generation"] == 0
-            else f"gen_{r['generation']-1:03d} synth"
-        )
-        print(
-            f"{r['generation']:<5} {source:<20} {r['fid']:>8.2f} {r['pixel_variance']:>10.4f} {r['masked_mse']:>12.4f}"
-        )
-    if len(results) == 2:
-        delta_fid = results[1]["fid"] - results[0]["fid"]
-        delta_var = results[1]["pixel_variance"] - results[0]["pixel_variance"]
-        delta_mse = results[1]["masked_mse"] - results[0]["masked_mse"]
-        print(
-            f"{'Delta':<5} {'gen0 -> gen1':<20} {delta_fid:>+8.2f} {delta_var:>+10.4f} {delta_mse:>+12.4f}"
-        )
+        source = "real CIFAR-10" if r["generation"] == 0 else f"gen_{r['generation']-1:03d} synth"
+        print(f"{r['generation']:<5} {source:<20} {r['fid']:>8.2f} {r['pixel_variance']:>10.4f} {r['image_mse']:>10.4f}")
     print(f"{'='*60}\n", flush=True)
 
     # ---------------------------------------------------------------------------
@@ -527,10 +514,10 @@ def main():
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        gens = [r["generation"] for r in results]
-        fids = [r["fid"] for r in results]
+        gens  = [r["generation"]     for r in results]
+        fids  = [r["fid"]            for r in results]
         vars_ = [r["pixel_variance"] for r in results]
-        mses = [r["masked_mse"] for r in results]
+        mses  = [r["image_mse"]      for r in results]
 
         fig, axes = plt.subplots(3, 1, figsize=(8, 10))
 
@@ -538,7 +525,7 @@ def main():
         axes[0].set_ylabel("FID")
         axes[0].set_title(
             f"Inpainting Experiment  (lam={lam:.2f}, {int(lam*100)}% masked)\n"
-            "Gen 0 = real data -> Gen 1 = synthetic data"
+            "Gen 0 = real data -> synthetic data"
         )
         axes[0].grid(True)
 
@@ -547,7 +534,7 @@ def main():
         axes[1].grid(True)
 
         axes[2].plot(gens, mses, marker="o", color="crimson")
-        axes[2].set_ylabel("Masked Region MSE")
+        axes[2].set_ylabel("Image MSE")
         axes[2].set_xlabel("Generation")
         axes[2].grid(True)
 

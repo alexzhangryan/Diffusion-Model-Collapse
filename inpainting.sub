@@ -23,12 +23,15 @@ when_to_transfer_output = ON_EXIT
 
 transfer_output_files   = output/, snapshots/
 
-request_cpus            = 4
+request_cpus            = 2
 request_memory          = 16GB
 request_disk            = 50GB
 request_gpus            = 1
 
-requirements            = (Target.CUDACapability >= 6.0) && (Target.CUDAGlobalMemoryMb >= 8192)
++WantGPULab             = true
++is_resumable           = true
+
+requirements            = (Target.CUDACapability >= 7.5) && (Target.CUDACapability < 8.7) && (Target.CUDAGlobalMemoryMb >= 16000)
 
 log                     = logs/inpainting_$(Cluster).log
 output                  = logs/inpainting_$(Cluster)_$(Process).out

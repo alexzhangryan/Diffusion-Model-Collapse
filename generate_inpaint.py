@@ -2,12 +2,14 @@
 """
 Replacement-based conditional inpainting using a pretrained EDM model.
 
-At every denoising step the known region (left half of each image) is
-enforced by replacing those pixels with the real image plus Gaussian noise
-at the current noise level.  The unknown region (right half) is generated
-freely by the diffusion model.  Final output is a composite:
+For each image, lam fraction of pixels are selected uniformly at random to
+be masked (independently per image, same locations across channels).  At
+every denoising step the known pixels are enforced by replacing them with
+the real image plus Gaussian noise at the current noise level.  The masked
+pixels are generated freely by the diffusion model.  Final output is a
+composite:
 
-    output = real_left_half  |  model_generated_right_half
+    output[known] = real[known],  output[masked] = model_generated[masked]
 
 This implements the "RePaint" strategy and works with any pretrained EDM
 checkpoint without retraining or architectural changes.
@@ -58,10 +60,16 @@ def save_composite(tensor: torch.Tensor, path: Path):
 
 def build_mask(B: int, C: int, H: int, W: int,
                lam: float, device: torch.device) -> torch.Tensor:
-    """Float mask: 1 = known (left half), 0 = unknown (right half)."""
-    mask = torch.ones(B, C, H, W, device=device)
-    mask[:, :, :, int(W * (1.0 - lam)):] = 0.0
-    return mask
+    """Float mask: 1 = known, 0 = unknown.
+    Randomly selects lam fraction of spatial pixels to mask, independently
+    per image.  The same pixel locations are masked across all channels."""
+    n_pixels = H * W
+    n_masked = int(n_pixels * lam)
+    mask = torch.ones(B, C, H * W, device=device)
+    for i in range(B):
+        idx = torch.randperm(n_pixels, device=device)[:n_masked]
+        mask[i, :, idx] = 0.0
+    return mask.view(B, C, H, W)
 
 
 @torch.no_grad()
