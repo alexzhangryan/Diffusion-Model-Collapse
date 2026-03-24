@@ -51,7 +51,7 @@ N_GENERATIONS = 10
 
 # Full-scale (server)
 N_IMAGES_FULL = 50_000   # use all 50k CIFAR-10 training images
-DURATION_FULL = 25.0     # Mimg
+DURATION_FULL = 25.0    # Mimg
 BATCH_FULL    = 512
 
 # Local: same parameters as server; snapshots saved every ~1 hr for easy resume
@@ -112,22 +112,15 @@ def find_latest_snapshot(train_dir: Path) -> Path:
 
 
 def save_generation_snapshot(gen: int, synth_dir: Path, results: list):
-    """Save synthetic images and results after a completed generation."""
+    """Record completed generation — metadata only, no image copy.
+    Synthetic images stay in output/gen_NNN/synthetic_images/ and survive
+    eviction via transfer_output_files = output/."""
     snap_dir = SNAPSHOTS_DIR / f"gen_{gen:03d}"
-    snap_images = snap_dir / "synthetic_images"
-    if snap_images.exists():
-        shutil.rmtree(snap_images)
-    shutil.copytree(synth_dir, snap_images)
+    snap_dir.mkdir(parents=True, exist_ok=True)
     (snap_dir / "checkpoint.json").write_text(
-        json.dumps(
-            {
-                "generation": gen,
-                "results": results,
-            },
-            indent=2,
-        )
+        json.dumps({"generation": gen, "synth_dir": str(synth_dir), "results": results}, indent=2)
     )
-    print(f"  [snapshot] Saved gen {gen} -> {snap_dir}", flush=True)
+    print(f"  [snapshot] Saved gen {gen} -> {snap_dir / 'checkpoint.json'}", flush=True)
 
 
 def load_latest_generation_snapshot():
@@ -143,8 +136,11 @@ def load_latest_generation_snapshot():
         return -1, None, []
     data = json.loads(ckpt.read_text())
     gen = data["generation"]
-    synth_dir = latest / "synthetic_images"
-    print(f"  [resume] Found snapshot at gen {gen} -> {latest}", flush=True)
+    synth_dir = Path(data["synth_dir"])
+    if not synth_dir.exists():
+        print(f"  [resume] Snapshot found for gen {gen} but synth_dir missing: {synth_dir}", flush=True)
+        return -1, None, []
+    print(f"  [resume] Resuming from gen {gen}, synth_dir={synth_dir}", flush=True)
     return gen, synth_dir, data["results"]
 
 
@@ -383,6 +379,8 @@ def main():
 
     local = args.local
     lam = args.lam
+    if local and args.generations == N_GENERATIONS:
+        args.generations = 5
     n_images = N_IMAGES_FULL
     duration = DURATION_FULL
     batch = BATCH_FULL
@@ -483,10 +481,12 @@ def main():
         with open(RESULTS_JSON, "w") as f:
             json.dump(results, f, indent=2)
 
+        print_summary_and_plot(results, lam)
         save_generation_snapshot(gen, synth_dir, results)
 
         # Clean up large files; keep training-state on local for mid-gen resume
-        train_zip.unlink(missing_ok=True)
+        if train_zip.exists():
+            train_zip.unlink()
         if not local:
             for pt in train_dir.glob("training-state-*.pt"):
                 if pt.exists():
@@ -494,9 +494,11 @@ def main():
 
         current_synth_dir = synth_dir
 
-    # ---------------------------------------------------------------------------
-    # Final metrics summary
-    # ---------------------------------------------------------------------------
+    print(f"\nDone. Results: {RESULTS_JSON}", flush=True)
+
+
+def print_summary_and_plot(results: list, lam: float):
+    """Print metrics table and save/overwrite the summary plot."""
     print(f"\n{'='*60}", flush=True)
     print(f"{'Gen':<5} {'Source':<20} {'FID':>8} {'PixelVar':>10} {'ImageMSE':>10}")
     print(f"{'-'*5} {'-'*20} {'-'*8} {'-'*10} {'-'*10}")
@@ -505,12 +507,8 @@ def main():
         print(f"{r['generation']:<5} {source:<20} {r['fid']:>8.2f} {r['pixel_variance']:>10.4f} {r['image_mse']:>10.4f}")
     print(f"{'='*60}\n", flush=True)
 
-    # ---------------------------------------------------------------------------
-    # Summary plot
-    # ---------------------------------------------------------------------------
     try:
         import matplotlib
-
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
@@ -541,12 +539,11 @@ def main():
         fig.tight_layout()
         plot_path = OUTPUT_DIR / f"inpainting_lambda{int(lam*100):03d}.png"
         fig.savefig(plot_path, dpi=150)
-        print(f"\n  -> Saved {plot_path}")
+        plt.close(fig)
+        print(f"  -> Saved {plot_path}", flush=True)
 
     except ImportError:
-        print("matplotlib not available; skipping plot.")
-
-    print(f"\nDone. Results: {RESULTS_JSON}", flush=True)
+        print("matplotlib not available; skipping plot.", flush=True)
 
 
 if __name__ == "__main__":
