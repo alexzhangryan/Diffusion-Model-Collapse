@@ -58,6 +58,12 @@ BATCH_FULL    = 512
 SNAP_LOCAL  = 150   # ticks between EDM snapshots (~1 hr on RTX 4080 @ ~28 s/tick)
 SNAP_SERVER = 500
 
+# Quick smoke-test (--test): completes 5 generations in ~2-3 minutes
+N_IMAGES_TEST  = 100
+DURATION_TEST  = 0.001   # Mimg (~100 gradient steps)
+BATCH_TEST     = 32
+SNAP_TEST      = 1
+
 # Paths
 EDM_DIR = Path("edm")
 CIFAR10_ZIP = Path("dataset/cifar10-32x32.zip")  # 50k train images
@@ -266,14 +272,14 @@ def compute_fid(
 
 
 def train_model(
-    data_zip: Path, out_dir: Path, duration: float, batch: int, local: bool
+    data_zip: Path, out_dir: Path, duration: float, batch: int, local: bool, test: bool = False
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     # Always use plain python — torchrun sets RANK/WORLD_SIZE which forces EDM
     # to init NCCL, and NCCL fails inside HTCondor containers.  With plain
     # python those env-vars are absent so EDM runs single-process without
     # touching NCCL at all.
-    snap = str(SNAP_LOCAL if local else SNAP_SERVER)
+    snap = str(SNAP_TEST if test else SNAP_LOCAL if local else SNAP_SERVER)
     cmd = [sys.executable, EDM_DIR / "train.py",
         "--outdir", out_dir,
         "--data",   data_zip,
@@ -356,7 +362,12 @@ def main():
     parser.add_argument(
         "--local",
         action="store_true",
-        help="Local test mode: fewer images, shorter training.",
+        help="Local mode: full server params, snapshots every ~1 hr.",
+    )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Smoke-test: 100 images, 0.001 Mimg, 5 gens, no FID. Completes in ~2-3 min.",
     )
     parser.add_argument(
         "--untar",
@@ -378,12 +389,21 @@ def main():
         unpack_tar(args.untar)
 
     local = args.local
-    lam = args.lam
-    if local and args.generations == N_GENERATIONS:
-        args.generations = 5
-    n_images = N_IMAGES_FULL
-    duration = DURATION_FULL
-    batch = BATCH_FULL
+    test  = args.test
+    lam   = args.lam
+
+    if test:
+        n_images = N_IMAGES_TEST
+        duration = DURATION_TEST
+        batch    = BATCH_TEST
+        if args.generations == N_GENERATIONS:
+            args.generations = 5
+    else:
+        n_images = N_IMAGES_FULL
+        duration = DURATION_FULL
+        batch    = BATCH_FULL
+        if local and args.generations == N_GENERATIONS:
+            args.generations = 5
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -395,7 +415,8 @@ def main():
     print(f"  Generations            : {args.generations}")
     print(f"  Images/gen             : {n_images}")
     print(f"  Train duration         : {duration} Mimg")
-    print(f"  Mode                   : {'LOCAL (snap every ~1 hr)' if local else 'SERVER'}")
+    mode_str = "TEST (no FID, 0.001 Mimg)" if test else "LOCAL (snap every ~1 hr)" if local else "SERVER"
+    print(f"  Mode                   : {mode_str}")
     print(f"{'='*60}\n", flush=True)
 
     # Extract all 50k CIFAR-10 training images once.
@@ -442,7 +463,7 @@ def main():
 
         # --- 3. Train on complete images ---
         print(f"  [3/4] Training (duration={duration} Mimg, batch={batch})...", flush=True)
-        train_model(train_zip, train_dir, duration, batch, local)
+        train_model(train_zip, train_dir, duration, batch, local, test)
         network_pkl = find_latest_snapshot(train_dir)
         print(f"  Checkpoint: {network_pkl}", flush=True)
 
@@ -459,7 +480,7 @@ def main():
 
         pixel_var = compute_pixel_variance(synth_dir)
         image_mse = compute_image_mse(synth_dir, cond_dir)
-        fid       = compute_fid(synth_dir, FID_REF_NPZ, batch, n_images)
+        fid       = -1.0 if test else compute_fid(synth_dir, FID_REF_NPZ, batch, n_images)
 
         print(f"  Pixel variance : {pixel_var:.4f}", flush=True)
         print(f"  Image MSE      : {image_mse:.4f}", flush=True)
@@ -484,9 +505,11 @@ def main():
         print_summary_and_plot(results, lam)
         save_generation_snapshot(gen, synth_dir, results)
 
-        # Clean up large files; keep training-state on local for mid-gen resume
+        # Clean up large files to keep output/ small for eviction transfers
         if train_zip.exists():
             train_zip.unlink()
+        for pkl in train_dir.glob("network-snapshot-*.pkl"):
+            pkl.unlink()
         if not local:
             for pt in train_dir.glob("training-state-*.pt"):
                 if pt.exists():
