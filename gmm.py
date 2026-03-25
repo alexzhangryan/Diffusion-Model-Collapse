@@ -9,9 +9,28 @@ import os
 os.environ["OMP_NUM_THREADS"] = "4"
 
 import numpy as np
+from pathlib import Path
 from scipy.stats import wasserstein_distance
 from sklearn.mixture import GaussianMixture
 import matplotlib.pyplot as plt
+
+
+def out_path(description: str, lam_values: list, N: int, accumulate: bool, dim: int) -> Path:
+    """Build output path and create directory if needed.
+
+    1D  → 1doutput/Description_lambda=X-Y_N=N_acc|sub.png
+    nD  → multivariateout/Description_lambda=X-Y_N=N_D=d_acc|sub.png
+    """
+    lam_str = "-".join(str(l) for l in lam_values)
+    acc_str = "acc" if accumulate else "sub"
+    if dim == 1:
+        directory = Path("1doutput")
+        fname = f"{description}_lambda={lam_str}_N={N}_{acc_str}.png"
+    else:
+        directory = Path("multivariateout")
+        fname = f"{description}_lambda={lam_str}_N={N}_D={dim}_{acc_str}.png"
+    directory.mkdir(exist_ok=True)
+    return directory / fname
 
 
 def sliced_wasserstein(X, Y, n_projections=50):
@@ -33,18 +52,18 @@ def count_covered_modes(fitted_means, true_means, threshold):
 if __name__ == "__main__":
 
     # --- Configuration ---
-    N = 1000  # Number of real data points
-    N_GENERATIONS = 5000
+    N = 5000  # Number of real data points
+    N_GENERATIONS = 1000
     LAMBDA_VALUES = [0, 0.1, 0.3, 0.5, 0.9, 1]
     ACCUMULATE = False  # True: append λ*N synthetic points; False: substitute
-    DIM = 1  # 1: 1D Gaussian;  2: 2D multi-modal GMM
+    DIM = 2  # 1: 1D Gaussian;  2: 2D multi-modal GMM
+    TUNE_LAMBDA = False  # False: skip lambda search entirely
 
-    # --- Recursive lambda search ---
+    # --- Recursive lambda search (only used if TUNE_LAMBDA = True) ---
     # Round 1: evaluate 4 candidates evenly spaced in [0, 1].
     # Each candidate runs for TUNE_EVAL_GENS generations; score = lambda * (mean_var / initial_var).
     # Best candidate becomes the centre of a narrower range for the next round.
     # Repeats for TUNE_ROUNDS rounds, converging on the highest lambda with least collapse.
-    TUNE_LAMBDA = True
     TUNE_ROUNDS = 5
     TUNE_N_CANDIDATES = 4
     TUNE_EVAL_GENS = 200    # generations to evaluate each candidate
@@ -60,6 +79,15 @@ if __name__ == "__main__":
     TRUE_WEIGHTS_2D = np.array([1 / 3, 1 / 3, 1 / 3])
     N_COMPONENTS_2D = len(TRUE_MEANS_2D)
     MODE_THRESHOLD = 2.0  # distance within which a mode counts as "covered"
+
+    # --- True population covariance trace for the 2D GMM ---
+    # Cov = sum_k w_k*(Sigma_k + mu_k mu_k^T) - mu_bar mu_bar^T
+    _mu_bar = TRUE_WEIGHTS_2D @ TRUE_MEANS_2D
+    _true_cov_2d = sum(
+        TRUE_WEIGHTS_2D[k] * (TRUE_COVS_2D[k] + np.outer(TRUE_MEANS_2D[k], TRUE_MEANS_2D[k]))
+        for k in range(N_COMPONENTS_2D)
+    ) - np.outer(_mu_bar, _mu_bar)
+    TRUE_TRACE_2D = float(np.trace(_true_cov_2d))
 
     # --- Generate real data ---
     if DIM == 1:
@@ -85,7 +113,7 @@ if __name__ == "__main__":
 
     for lam in LAMBDA_VALUES:
         n_synthetic = int(N * lam)
-        real_subset = real_data[: N - n_synthetic].copy() if not ACCUMULATE else None
+        n_keep = N - n_synthetic
 
         vars_over_gen = []
         cov_over_gen = []
@@ -94,11 +122,11 @@ if __name__ == "__main__":
         current_data = real_data.copy()
 
         for gen in range(N_GENERATIONS):
-            # Track variance (trace/d for multivariate)
+            # Track variance (1D) or covariance trace (2D)
             if DIM == 1:
                 vars_over_gen.append(float(current_data.var()))
             else:
-                vars_over_gen.append(float(np.trace(np.cov(current_data.T)) / DIM))
+                vars_over_gen.append(float(np.trace(np.cov(current_data.T))))
 
             # Fit GMM
             gmm = GaussianMixture(
@@ -121,20 +149,23 @@ if __name__ == "__main__":
                     sliced_wasserstein(current_data[idx], real_data[:n_sub])
                 )
 
-            # Generate and update dataset
+            # Generate and update dataset (inpainting-style)
+            # λ*N points are replaced by GMM samples; the rest survive from
+            # the previous generation's data — no re-anchoring to real_data.
             if n_synthetic == 0:
-                current_data = real_data.copy()
+                pass  # nothing changes; current_data carries forward unchanged
             elif ACCUMULATE:
                 synthetic_data, _ = gmm.sample(n_synthetic)
                 current_data = np.vstack([current_data, synthetic_data])
             else:
+                keep_idx = np.random.choice(len(current_data), n_keep, replace=False)
                 synthetic_data, _ = gmm.sample(n_synthetic)
-                current_data = np.vstack([real_subset, synthetic_data])
+                current_data = np.vstack([current_data[keep_idx], synthetic_data])
 
             if gen % 10 == 0 or gen == N_GENERATIONS - 1:
                 print(
                     f"lambda={lam:.1f}  gen={gen:3d}  "
-                    f"n={len(current_data):6d}  var={vars_over_gen[-1]:.4f}"
+                    f"n={len(current_data):6d}  {'var' if DIM == 1 else 'cov_trace'}={vars_over_gen[-1]:.4f}"
                 )
 
         all_vars[lam] = vars_over_gen
@@ -149,21 +180,23 @@ if __name__ == "__main__":
     for lam in LAMBDA_VALUES:
         ax_var.plot(generations, all_vars[lam], label=f"λ = {lam}", zorder=1 - lam)
     if DIM == 1:
-        ax_var.axhline(
-            TRUE_VAR_1D[0, 0],
-            color="black",
-            linestyle="--",
-            alpha=0.5,
-            label="True variance",
-        )
+        true_ref = TRUE_VAR_1D[0, 0]
+        ax_var.axhline(true_ref, color="black", linestyle="--", alpha=0.5, label="True variance")
+        ax_var.set_ylabel("Variance")
+        ax_var.set_ylim(0, true_ref * 2)
+    else:
+        true_ref = TRUE_TRACE_2D
+        ax_var.axhline(true_ref, color="black", linestyle="--", alpha=0.5, label="True cov trace")
+        ax_var.set_ylabel("Covariance trace  (tr Σ)")
+        margin = true_ref * 0.6
+        ax_var.set_ylim(max(0, true_ref - margin), true_ref + margin)
     ax_var.set_xlabel("Generation")
-    ax_var.set_ylabel("Variance" if DIM == 1 else "Mean variance (trace / d)")
-    ax_var.set_ylim(0, 4)
-    ax_var.set_title(f"Variance over Generations  (N = {N} data points)")
+    ax_var.set_title(f"Covariance Trace over Generations  (N = {N} data points)")
     ax_var.legend()
     fig_var.tight_layout()
-    fig_var.savefig("gmm_variance.png", dpi=150)
-    print("  -> Saved gmm_variance.png")
+    p = out_path("variance", LAMBDA_VALUES, N, ACCUMULATE, DIM)
+    fig_var.savefig(p, dpi=150)
+    print(f"  -> Saved {p}")
 
     if DIM == 2:
         # --- Figure 1b: Mode coverage ---
@@ -181,8 +214,9 @@ if __name__ == "__main__":
         ax_cov.set_title(f"Mode Coverage over Generations  (N = {N} data points)")
         ax_cov.legend()
         fig_cov.tight_layout()
-        fig_cov.savefig("gmm_mode_coverage.png", dpi=150)
-        print("  -> Saved gmm_mode_coverage.png")
+        p = out_path("mode_coverage", LAMBDA_VALUES, N, ACCUMULATE, DIM)
+        fig_cov.savefig(p, dpi=150)
+        print(f"  -> Saved {p}")
 
         # --- Figure 1c: Wasserstein distance ---
         fig_wass, ax_wass = plt.subplots(figsize=(8, 5))
@@ -197,8 +231,9 @@ if __name__ == "__main__":
         )
         ax_wass.legend()
         fig_wass.tight_layout()
-        fig_wass.savefig("gmm_wasserstein.png", dpi=150)
-        print("  -> Saved gmm_wasserstein.png")
+        p = out_path("wasserstein", LAMBDA_VALUES, N, ACCUMULATE, DIM)
+        fig_wass.savefig(p, dpi=150)
+        print(f"  -> Saved {p}")
 
     # --- Figure 2: Distribution comparisons per lambda ---
     n_lambdas = len(LAMBDA_VALUES)
@@ -268,8 +303,9 @@ if __name__ == "__main__":
             ax.set_title(f"λ = {lam}")
             ax.legend(markerscale=3, fontsize=7)
     fig_dist.tight_layout()
-    fig_dist.savefig("gmm_distributions.png", dpi=150)
-    print("  -> Saved gmm_distributions.png")
+    p = out_path("distributions", LAMBDA_VALUES, N, ACCUMULATE, DIM)
+    fig_dist.savefig(p, dpi=150)
+    print(f"  -> Saved {p}")
 
     # ---------------------------------------------------------------------------
     # Recursive lambda search
@@ -343,7 +379,8 @@ if __name__ == "__main__":
         )
         ax_tune.legend(fontsize=8)
         fig_tune.tight_layout()
-        fig_tune.savefig("gmm_tune_lambda.png", dpi=150)
-        print("  -> Saved gmm_tune_lambda.png")
+        p = out_path("tune_lambda", LAMBDA_VALUES, N, ACCUMULATE, DIM)
+        fig_tune.savefig(p, dpi=150)
+        print(f"  -> Saved {p}")
 
     plt.show()

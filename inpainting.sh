@@ -24,8 +24,8 @@ if [ -f "inpainting.tar.gz" ] && [ ! -d "edm" ]; then
     ls -la
 fi
 
-# Always ensure output dir exists before HTCondor tries to transfer it
-mkdir -p output
+# Ensure both output dirs exist before HTCondor tries to transfer them back
+mkdir -p output snapshots
 
 # ---------------------------------------------------------------------------
 # Step 1: Convert raw CIFAR-10 dataset -> EDM zip format
@@ -60,7 +60,8 @@ fi
 # ---------------------------------------------------------------------------
 # Step 3: Run the inpainting experiment
 # ---------------------------------------------------------------------------
-mkdir -p output
+mkdir -p output snapshots
+pip install -q wandb 2>/dev/null || true
 echo ">>> [3/3] Starting EDM inpainting experiment..."
 
 if [ "$LOCAL_FLAG" = "--local" ]; then

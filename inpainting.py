@@ -3,18 +3,20 @@
 Inpainting model-collapse experiment using EDM on CIFAR-10.
 
 Each generation:
-  1. Train an EDM model on the previous generation's composite images
+  1. Train an EDM model on the previous generation's generated images
      (real CIFAR-10 for generation 0).  Training uses COMPLETE images —
      no masking — so the model learns the full image distribution.
-  2. Run conditional inpainting: a randomly-placed window of width lam*W
-     is masked in each conditioning image.  The model fills in the masked
-     region; the rest is replaced with the real pixel values (RePaint style).
-     Output = real_unmasked_region | model_generated_masked_region.
+  2. Generate new images conditioned on the fully real CIFAR-10 data:
+     a randomly selected lam fraction of pixels is masked per image.
+     At every denoising step the unmasked pixels are replaced with the
+     real image + noise at the current noise level (RePaint strategy),
+     guiding the model.  The stored output is the model's full generation
+     — real pixels are NOT pasted back, so training data is purely synthetic.
   3. Measure quality:
-       - MSE between generated composites and original images (full image)
-       - Pixel variance of the composite images
+       - MSE between generated images and original real images
+       - Pixel variance of the generated images
        - FID vs. real CIFAR-10
-  4. The composite images become the training set for the next generation.
+  4. The generated images become the training set for the next generation.
 
 All 50k CIFAR-10 training images are used for both training and conditioning
 each generation.  No data-leak concern: the distribution shifts from real to
@@ -42,21 +44,29 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Configuration  ? change LAMBDA here or pass --lambda on the command line
 # ---------------------------------------------------------------------------
 LAMBDA = 0.5  # fraction of image width to mask (right side)
 
-N_GENERATIONS = 10
+N_GENERATIONS = 20
 
 # Full-scale (server)
 N_IMAGES_FULL = 50_000   # use all 50k CIFAR-10 training images
-DURATION_FULL = 25.0    # Mimg
+DURATION_FULL = 25.0     # Mimg
 BATCH_FULL    = 512
 
-# Local: same parameters as server; snapshots saved every ~1 hr for easy resume
-SNAP_LOCAL  = 150   # ticks between EDM snapshots (~1 hr on RTX 4080 @ ~28 s/tick)
-SNAP_SERVER = 500
+# Checkpoint frequency: .pkl network snapshots + .pt training-state files.
+# Keep only the 2 most recent .pkl per generation; older ones are pruned.
+SNAP_LOCAL  = 50    # ticks between checkpoints
+SNAP_SERVER = 50    # ticks between checkpoints
+MAX_PKLS_PER_GEN = 1  # keep only the latest .pkl; delete when a new one is saved
 
 # Quick smoke-test (--test): completes 5 generations in ~2-3 minutes
 N_IMAGES_TEST  = 100
@@ -70,7 +80,12 @@ CIFAR10_ZIP = Path("dataset/cifar10-32x32.zip")  # 50k train images
 FID_REF_NPZ = Path("cifar10-32x32.npz")
 OUTPUT_DIR = Path("output")
 SNAPSHOTS_DIR = Path("snapshots")
+CHECKPOINT_TAR = Path("checkpoint.tar.gz")  # single-file spool checkpoint
+SAMPLES_DIR = OUTPUT_DIR / "samples"        # 100-image gallery, one subdir per gen
+N_CHECKPOINT_SAMPLES = 100                  # images saved per generation
 RESULTS_JSON = OUTPUT_DIR / "results.json"
+WANDB_PROJECT = "inpainting-collapse"
+WANDB_RUN_ID_FILE = OUTPUT_DIR / "wandb_run_id.txt"
 
 IMAGE_SIZE = 32  # CIFAR-10 images are 32?32
 
@@ -148,6 +163,83 @@ def load_latest_generation_snapshot():
         return -1, None, []
     print(f"  [resume] Resuming from gen {gen}, synth_dir={synth_dir}", flush=True)
     return gen, synth_dir, data["results"]
+
+
+def save_generation_samples(gen: int, synth_dir: Path, n: int = N_CHECKPOINT_SAMPLES):
+    """Copy up to n randomly selected images from synth_dir into the samples gallery.
+
+    Stored at output/samples/gen_NNN/ so the gallery accumulates across all
+    generations and survives eviction inside checkpoint.tar.gz.
+    """
+    sample_dir = SAMPLES_DIR / f"gen_{gen:03d}"
+    if sample_dir.exists():
+        shutil.rmtree(sample_dir)
+    sample_dir.mkdir(parents=True)
+
+    all_images = sorted(synth_dir.rglob("*.png"))
+    chosen = all_images[:n] if len(all_images) <= n else [
+        all_images[i] for i in sorted(
+            np.random.choice(len(all_images), n, replace=False)
+        )
+    ]
+    for img_path in chosen:
+        shutil.copy2(img_path, sample_dir / img_path.name)
+    print(f"  [samples] Saved {len(chosen)} samples -> {sample_dir}", flush=True)
+
+
+def save_checkpoint(gen: int, synth_dir: Path, results: list, train_dir: Path = None):
+    """Pack the minimum state needed to resume into a single checkpoint.tar.gz.
+
+    Contains:
+    - snapshots/           (generation metadata, tiny)
+    - synth_dir            (latest completed gen's synthetic images; skipped for
+                            real_images_train since it is re-extracted from the zip)
+    - train_dir (optional) (current in-progress training dir: latest .pt + .pkl,
+                            so EDM can resume mid-generation via --resume)
+    - output/samples/      (100-image gallery from every completed generation)
+    - output/results.json  (accumulated metrics)
+
+    A single tar transfers cleanly through the HTCondor spool without the
+    directory-stripping that affects folder entries in transfer_output_files.
+    Written atomically via a .tmp file to avoid a partial tar on eviction.
+    """
+    real_images_dir = OUTPUT_DIR / "real_images_train"
+    tmp = CHECKPOINT_TAR.with_suffix(".tmp.gz")
+    with tarfile.open(tmp, "w:gz") as tf:
+        if SNAPSHOTS_DIR.exists():
+            tf.add(SNAPSHOTS_DIR)
+        # Skip packing real_images_train — it is re-extracted from cifar zip on restart.
+        if synth_dir is not None and synth_dir.exists() and synth_dir != real_images_dir:
+            tf.add(synth_dir)
+        # Pack latest training-state .pt and network .pkl for mid-generation resume.
+        if train_dir is not None and train_dir.exists():
+            for pt in sorted(train_dir.glob("training-state-*.pt"))[-1:]:
+                tf.add(pt)
+            for pkl in sorted(train_dir.glob("network-snapshot-*.pkl"))[-1:]:
+                tf.add(pkl)
+        if SAMPLES_DIR.exists():
+            tf.add(SAMPLES_DIR)
+        results_file = OUTPUT_DIR / "results.json"
+        if results_file.exists():
+            tf.add(results_file)
+        if WANDB_RUN_ID_FILE.exists():
+            tf.add(WANDB_RUN_ID_FILE)
+    tmp.replace(CHECKPOINT_TAR)
+    mid = " (mid-training)" if train_dir else ""
+    print(f"  [checkpoint] Saved {CHECKPOINT_TAR} (gen {gen}{mid})", flush=True)
+
+
+def load_checkpoint():
+    """Extract checkpoint.tar.gz if present (delivered here by HTCondor spool on restart)."""
+    if not CHECKPOINT_TAR.exists():
+        return
+    print("  [resume] Found checkpoint.tar.gz — extracting...", flush=True)
+    try:
+        with tarfile.open(CHECKPOINT_TAR) as tf:
+            tf.extractall(".")
+        print("  [resume] Checkpoint restored.", flush=True)
+    except Exception as e:
+        print(f"  [resume] WARNING: checkpoint extraction failed ({e}), starting fresh.", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -272,35 +364,105 @@ def compute_fid(
 
 
 def train_model(
-    data_zip: Path, out_dir: Path, duration: float, batch: int, local: bool, test: bool = False
+    gen: int, data_zip: Path, out_dir: Path, duration: float, batch: int, local: bool, test: bool = False,
+    checkpoint_callback=None,
 ):
+    import re
     out_dir.mkdir(parents=True, exist_ok=True)
     # Always use plain python — torchrun sets RANK/WORLD_SIZE which forces EDM
     # to init NCCL, and NCCL fails inside HTCondor containers.  With plain
     # python those env-vars are absent so EDM runs single-process without
     # touching NCCL at all.
     snap = str(SNAP_TEST if test else SNAP_LOCAL if local else SNAP_SERVER)
-    cmd = [sys.executable, EDM_DIR / "train.py",
+    cmd = [str(c) for c in [sys.executable, EDM_DIR / "train.py",
         "--outdir", out_dir,
         "--data",   data_zip,
         "--cond=1",
         "--arch=ddpmpp",
-        "--precond=vp",
+        "--precond=edm",
         "--duration", str(duration),
         "--batch",    str(batch),
         "--nosubdir",
         "--tick=10",
         f"--snap={snap}",
-        "--fp16=1",
-        "--workers=4",
-    ]
+        f"--dump={snap}",
+    ]]
+    if not test:
+        cmd += ["--fp16=1", "--workers=4"]
     # Resume mid-generation if a training state file exists (local restarts).
     resume_states = sorted(out_dir.glob("training-state-*.pt"))
     if resume_states:
         cmd += ["--resume", str(resume_states[-1])]
         print(f"  [resume] Resuming training from {resume_states[-1]}", flush=True)
-    assert_cuda_available()
-    run(cmd)
+    if not test:
+        assert_cuda_available()
+
+    # Stream output line-by-line so we can parse tick stats for W&B.
+    # tick 0   kimg 0.0   time 5s   sec/tick 0.9   sec/kimg 27.66   gpumem 6.88 ...
+    tick_re = re.compile(
+        r"tick\s+(\d+)\s+kimg\s+([\d.]+).*?sec/tick\s+([\d.]+).*?sec/kimg\s+([\d.]+)"
+        r"(?:.*?gpumem\s+([\d.]+))?"
+    )
+    printable = " ".join(cmd)
+    print(f"\n>>> {printable}\n", flush=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        m = tick_re.search(line)
+        if m:
+            tick, kimg, sec_per_tick, sec_per_kimg, gpumem = m.groups()
+            tick_num = int(tick)
+            loss = None
+
+            # Read all stats from stats.jsonl (EDM writes it after each tick).
+            stats_file = out_dir / "stats.jsonl"
+            parsed_stats = {}
+            if stats_file.exists():
+                try:
+                    last_line = stats_file.read_text().strip().splitlines()[-1]
+                    raw = json.loads(last_line)
+                    for key, val in raw.items():
+                        if isinstance(val, dict) and "mean" in val:
+                            parsed_stats[key] = val["mean"]
+                    loss = parsed_stats.get("Loss/loss")
+                    if loss is not None:
+                        print(f"  [loss] {loss:.6f}", flush=True)
+                except Exception:
+                    pass
+
+            # Prune mid-training to bound disk use.
+            # Keep only the latest .pt (only ever need one for resume).
+            for old_pt in sorted(out_dir.glob("training-state-*.pt"))[:-1]:
+                old_pt.unlink()
+            # Keep only the latest MAX_PKLS_PER_GEN .pkl snapshots.
+            for old_pkl in sorted(out_dir.glob("network-snapshot-*.pkl"))[:-MAX_PKLS_PER_GEN]:
+                old_pkl.unlink()
+
+            # Save a mid-training checkpoint one tick AFTER EDM writes its state
+            # files.  EDM prints the tick line first, then writes .pt/.pkl —
+            # so at tick N the files from tick N are not yet on disk.  We fire
+            # at tick N+1 (i.e. when tick_num-1 is a multiple of snap) so the
+            # state from the previous snap boundary is safely on disk.
+            if checkpoint_callback is not None and tick_num > 1 and (tick_num - 1) % int(snap) == 0:
+                checkpoint_callback(out_dir)
+
+            if WANDB_AVAILABLE:
+                log_dict = {
+                    "train/tick":         int(tick),
+                    "train/kimg":         float(kimg),
+                    "train/sec_per_tick": float(sec_per_tick),
+                    "train/sec_per_kimg": float(sec_per_kimg),
+                    "train/gpumem_gb":    float(gpumem) if gpumem else None,
+                    "generation":         gen,
+                }
+                # Log all stats from stats.jsonl under train/ namespace.
+                for key, val in parsed_stats.items():
+                    wandb_key = "train/" + key.replace("/", "_").lower()
+                    log_dict[wandb_key] = val
+                wandb.log(log_dict)
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
 def generate_inpainted_images(
@@ -311,7 +473,12 @@ def generate_inpainted_images(
     lam: float,
     batch: int,
 ):
-    """Run replacement-based inpainting: real left half + model right half."""
+    """Generate images conditioned on real data with random pixel masking.
+
+    lam fraction of pixels are randomly masked per image.  The real image
+    guides the denoising at each step (RePaint), but the stored output is
+    the model's complete generation — not a composite with real pixels pasted in.
+    """
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True)
@@ -409,6 +576,37 @@ def main():
     SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(EDM_DIR.resolve()))
 
+    # Restore output/ and snapshots/ from the spool checkpoint if present.
+    # Must happen before load_latest_generation_snapshot() reads snapshots/.
+    load_checkpoint()
+
+    # Guarantee checkpoint.tar.gz exists so HTCondor can always transfer it
+    # back even if the job is interrupted before the first generation completes.
+    if not CHECKPOINT_TAR.exists():
+        with tarfile.open(CHECKPOINT_TAR, "w:gz") as _tf:
+            pass
+
+    # Initialise W&B.  Reuse the same run ID across evictions so all
+    # generations appear in one continuous run on the dashboard.
+    if WANDB_AVAILABLE:
+        if WANDB_RUN_ID_FILE.exists():
+            _wandb_id = WANDB_RUN_ID_FILE.read_text().strip()
+        else:
+            _wandb_id = wandb.util.generate_id()
+            WANDB_RUN_ID_FILE.write_text(_wandb_id)
+        wandb.init(
+            project=WANDB_PROJECT,
+            id=_wandb_id,
+            resume="allow",
+            config={
+                "lambda": lam,
+                "n_generations": args.generations,
+                "n_images": n_images,
+                "duration_mimg": duration,
+                "batch": batch,
+            },
+        )
+
     print(f"\n{'='*60}", flush=True)
     print(f"EDM Inpainting Experiment")
     print(f"  Lambda (mask fraction) : {lam:.2f}  ({int(lam*100)}% of width masked)")
@@ -462,13 +660,26 @@ def main():
         shutil.rmtree(stage_dir, ignore_errors=True)
 
         # --- 3. Train on complete images ---
-        print(f"  [3/4] Training (duration={duration} Mimg, batch={batch})...", flush=True)
-        train_model(train_zip, train_dir, duration, batch, local, test)
+        # Skip training if a network snapshot already exists (e.g. recovered
+        # from a previous run) — go straight to generation with the saved pkl.
+        existing_pkl = find_latest_snapshot(train_dir) if train_dir.exists() else None
+        if existing_pkl is not None:
+            print(f"  [3/4] Skipping training — existing pkl found: {existing_pkl}", flush=True)
+        else:
+            print(f"  [3/4] Training (duration={duration} Mimg, batch={batch})...", flush=True)
+            # Mid-training checkpoint callback: saves training-state .pt + .pkl so
+            # the job can resume from within this generation after an eviction.
+            _mid_synth = current_synth_dir  # prev gen's synth dir (None for gen 0)
+            _mid_results = list(results)    # copy so closure captures current state
+            def _ckpt_cb(td):
+                save_checkpoint(gen, _mid_synth, _mid_results, train_dir=td)
+            train_model(gen, train_zip, train_dir, duration, batch, local, test,
+                        checkpoint_callback=_ckpt_cb)
         network_pkl = find_latest_snapshot(train_dir)
         print(f"  Checkpoint: {network_pkl}", flush=True)
 
-        # --- 4. Conditional inpainting: real left half + model right half ---
-        print(f"  [4/4] Inpainting {n_images} images (lam={lam:.2f})...", flush=True)
+        # --- 4. Generate from real data with random pixel masking ---
+        print(f"  [4/4] Generating {n_images} images from real data (lam={lam:.2f} masked)...", flush=True)
         generate_inpainted_images(network_pkl, cond_dir, synth_dir, n_images, lam, batch)
         # Propagate labels so next generation can train with --cond=1
         src_json = cond_dir / "dataset.json"
@@ -503,17 +714,41 @@ def main():
             json.dump(results, f, indent=2)
 
         print_summary_and_plot(results, lam)
+        save_generation_samples(gen, synth_dir)
         save_generation_snapshot(gen, synth_dir, results)
 
-        # Clean up large files to keep output/ small for eviction transfers
+        if WANDB_AVAILABLE:
+            log = {
+                "fid":            fid,
+                "pixel_variance": pixel_var,
+                "image_mse":      image_mse,
+            }
+            sample_dir = SAMPLES_DIR / f"gen_{gen:03d}"
+            if sample_dir.exists():
+                imgs = sorted(sample_dir.glob("*.png"))[:32]
+                log["samples"] = [wandb.Image(str(p)) for p in imgs]
+            wandb.log(log, step=gen)
+
+        # --- Checkpoint housekeeping ---
+
+        # Remove training data zip (large, no longer needed).
         if train_zip.exists():
             train_zip.unlink()
-        for pkl in train_dir.glob("network-snapshot-*.pkl"):
+
+        # Prune this generation's mid-training .pkl files, keeping only the
+        # final snapshot (highest kimg) for later evaluation.
+        all_pkls = sorted(train_dir.glob("network-snapshot-*.pkl"))
+        for pkl in all_pkls[:-1]:
             pkl.unlink()
-        if not local:
-            for pt in train_dir.glob("training-state-*.pt"):
-                if pt.exists():
-                    pt.unlink()
+
+        # Training-state .pt files are only needed for mid-generation resume.
+        # The generation is now fully complete, so they can be removed.
+        for pt in train_dir.glob("training-state-*.pt"):
+            pt.unlink()
+
+        # Pack the minimum resume state into a single tar for HTCondor spool.
+        # Must be last so deleted files above are not included.
+        save_checkpoint(gen, synth_dir, results)
 
         current_synth_dir = synth_dir
 

@@ -15,13 +15,13 @@ container_image         = docker://genjigod/edm-experiment:latest
 executable              = inpainting.sh
 arguments               =
 
-environment             = "PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1"
+environment             = "PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 WANDB_API_KEY=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"
 
-transfer_input_files    = inpainting.tar.gz, snapshots/, output/
+transfer_input_files    = inpainting.tar.gz, checkpoint.tar.gz
 should_transfer_files   = YES
 when_to_transfer_output = ON_EXIT_OR_EVICT
 
-transfer_output_files   = output/, snapshots/
+transfer_output_files   = checkpoint.tar.gz
 
 request_cpus            = 2
 request_memory          = 16GB

@@ -1,0 +1,13 @@
+{
+  "generation": 0,
+  "synth_dir": "output/gen_000/synthetic_images",
+  "results": [
+    {
+      "generation": 0,
+      "lambda": 0.5,
+      "fid": -1.0,
+      "pixel_variance": 10026.8349609375,
+      "image_mse": 10032.18890625
+    }
+  ]
+}

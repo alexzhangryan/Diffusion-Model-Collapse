@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-Replacement-based conditional inpainting using a pretrained EDM model.
+Conditional inpainting using a pretrained EDM model (RePaint strategy).
 
 For each image, lam fraction of pixels are selected uniformly at random to
 be masked (independently per image, same locations across channels).  At
-every denoising step the known pixels are enforced by replacing them with
-the real image plus Gaussian noise at the current noise level.  The masked
-pixels are generated freely by the diffusion model.  Final output is a
-composite:
+every denoising step the known (unmasked) pixels are enforced by replacing
+them with the real image plus Gaussian noise at the current noise level.
+The masked pixels are generated freely by the diffusion model.
 
-    output[known] = real[known],  output[masked] = model_generated[masked]
-
-This implements the "RePaint" strategy and works with any pretrained EDM
-checkpoint without retraining or architectural changes.
+The saved output is the model's complete generated image — not a composite.
+The real data acts purely as conditioning during sampling; the stored result
+is what the model produced.
 
 Usage (called automatically by inpainting.py):
     python generate_inpaint.py \
@@ -82,6 +80,7 @@ def heun_inpaint(
     sigma_max: float = 80.0,
     rho: float = 7.0,
     class_labels=None,
+    use_net_sigma_bounds: bool = True,
 ) -> torch.Tensor:
     """
     EDM Heun sampler with per-step replacement (RePaint).
@@ -96,10 +95,26 @@ def heun_inpaint(
 
     Returns
     -------
-    Composite [B, C, H, W]: known pixels from `real`, unknown from model.
+    [B, C, H, W] model-generated images in [-1, 1].  Real data is used as
+    conditioning throughout sampling but is NOT pasted back; the output is
+    purely what the model produced.
     """
+    # Cast to float32 — FP16 cannot represent sigma values up to 80.0
+    # without overflow, producing NaN which saves as all-black images.
+    net = net.float()
+    real = real.float()
+    mask = mask.float()
+    if class_labels is not None:
+        class_labels = class_labels.float()
+
     device = real.device
     B = real.shape[0]
+
+    # Clip sigma bounds to what the network was trained on (critical for VP
+    # preconditioning where sigma_max ~152, not 80).
+    if use_net_sigma_bounds:
+        sigma_min = max(sigma_min, float(net.sigma_min))
+        sigma_max = min(sigma_max, float(net.sigma_max))
 
     # EDM sigma schedule (Eq. 5 in Karras et al. 2022)
     idx = torch.arange(steps, dtype=torch.float64, device=device)
@@ -108,7 +123,8 @@ def heun_inpaint(
         + idx / max(steps - 1, 1)
         * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))
     ) ** rho
-    sigmas = torch.cat([sigmas, sigmas.new_zeros(1)])  # append ?=0
+    sigmas = net.round_sigma(sigmas)
+    sigmas = torch.cat([sigmas, sigmas.new_zeros(1)])  # append σ=0
 
     # Start from pure noise
     x = torch.randn_like(real) * sigmas[0]
@@ -135,8 +151,10 @@ def heun_inpaint(
 
         x = x_next
 
-    # Final composite: real left half pasted over generated output
-    return mask * real + (1 - mask) * x
+    # Return the model's full generated output.
+    # Real data guided the sampling via per-step replacement but is not
+    # pasted back — the result is purely what the model produced.
+    return x
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +173,7 @@ def main():
     ap.add_argument("--n",       type=int, default=None,
                     help="Max number of images to process (default: all).")
     ap.add_argument("--lam",     type=float, default=0.5,
-                    help="Fraction of width to inpaint (right side). Default 0.5.")
+                    help="Fraction of pixels to mask (randomly selected). Default 0.5.")
     ap.add_argument("--steps",   type=int,   default=18,
                     help="Denoising steps. Default 18.")
     ap.add_argument("--batch",   type=int,   default=64,
@@ -186,6 +204,17 @@ def main():
     print(f"[inpaint] {len(src_paths)} source images -> {args.outdir}",
           flush=True)
 
+    # Load class labels from dataset.json if present.
+    # Maps relative path -> integer class index.
+    label_map = {}
+    dataset_json = Path(args.images) / "dataset.json"
+    if dataset_json.exists():
+        import json
+        meta = json.loads(dataset_json.read_text())
+        for rel, cls in (meta.get("labels") or []):
+            label_map[rel] = cls
+        print(f"[inpaint] loaded {len(label_map)} labels from dataset.json", flush=True)
+
     out_root = Path(args.outdir)
 
     for b_start in tqdm.trange(0, len(src_paths), args.batch,
@@ -195,12 +224,15 @@ def main():
         B, C, H, W = real.shape
         mask = build_mask(B, C, H, W, args.lam, device)
 
-        # Random class labels (matches unconditional generation behaviour)
+        # Use the true class label for each image when available.
+        # Falls back to random labels if dataset.json is missing.
         class_labels = None
         if label_dim:
-            rand_idx = torch.randint(label_dim, (B,), device=device)
             class_labels = torch.zeros(B, label_dim, device=device)
-            class_labels.scatter_(1, rand_idx.unsqueeze(1), 1)
+            for i, p in enumerate(batch_paths):
+                rel = str(Path(p).relative_to(Path(args.images))).replace("\\", "/")
+                cls = label_map.get(rel, int(torch.randint(label_dim, (1,)).item()))
+                class_labels[i, cls] = 1.0
 
         composites = heun_inpaint(net, real, mask,
                                    steps=args.steps,

@@ -20,7 +20,8 @@ RUN pip install --no-cache-dir \
     imageio \
     "imageio-ffmpeg>=0.4.3" \
     pyspng \
-    matplotlib
+    matplotlib \
+    wandb
 
 # Set working directory
 WORKDIR /experiment
