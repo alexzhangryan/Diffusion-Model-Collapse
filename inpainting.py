@@ -14,7 +14,7 @@ Each generation:
      — real pixels are NOT pasted back, so training data is purely synthetic.
   3. Measure quality:
        - MSE between generated images and original real images
-       - Pixel variance of the generated images
+       - Pixel variance of the generated imaGITges
        - FID vs. real CIFAR-10
   4. The generated images become the training set for the next generation.
 
@@ -723,11 +723,32 @@ def main():
                 "pixel_variance": pixel_var,
                 "image_mse":      image_mse,
             }
+            # Log up to 100 sample images.
             sample_dir = SAMPLES_DIR / f"gen_{gen:03d}"
             if sample_dir.exists():
-                imgs = sorted(sample_dir.glob("*.png"))[:32]
+                imgs = sorted(sample_dir.glob("*.png"))[:100]
                 log["samples"] = [wandb.Image(str(p)) for p in imgs]
+            # Log the summary plot image.
+            plot_path = OUTPUT_DIR / f"inpainting_lambda{int(lam*100):03d}.png"
+            if plot_path.exists():
+                log["plot"] = wandb.Image(str(plot_path))
             wandb.log(log, step=gen)
+
+            # Save results.json and the plot as wandb files (synced to run).
+            if RESULTS_JSON.exists():
+                wandb.save(str(RESULTS_JSON), base_path=str(OUTPUT_DIR), policy="now")
+            if plot_path.exists():
+                wandb.save(str(plot_path), base_path=str(OUTPUT_DIR), policy="now")
+
+            # Upload the final network .pkl for this generation as an artifact.
+            artifact = wandb.Artifact(
+                name=f"model-gen{gen:03d}",
+                type="model",
+                description=f"EDM network snapshot for generation {gen} (lam={lam:.2f})",
+                metadata=record,
+            )
+            artifact.add_file(str(network_pkl))
+            wandb.log_artifact(artifact)
 
         # --- Checkpoint housekeeping ---
 
